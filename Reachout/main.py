@@ -1,9 +1,11 @@
 """
-Main script to orchestrate FreeScout email automation.
+CLI: orchestrate FreeScout email sending (reads spreadsheet via sponsor_reader, sends via freescout_automation).
 
-Round workflow (status-based leads):
-  1. Extract round CSV: python extract_round_leads.py "path/to/2026 Sponsor Prospects - Assigning Roles v2.xlsx" [-o round_leads.csv]
-  2. Send emails:       python main.py round_leads.csv [--start-from N]
+Inputs: path to .xlsx / .xls / .csv — see Reachout/README.md §5 (standard vs round CSV, required columns).
+
+Round workflow:
+  1. python extract_round_leads.py "path/to/master.xlsx" [-o round.csv]
+  2. python main.py round.csv [--start-from N]
 """
 import argparse
 import sys

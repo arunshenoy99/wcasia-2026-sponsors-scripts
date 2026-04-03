@@ -1,5 +1,7 @@
 """
-Module for reading and processing sponsor data from Excel/CSV files
+Read sponsor rows from Excel/CSV for main.py (standard or round CSV).
+
+See Reachout/README.md §5 and "File structure and how everything is used".
 """
 import pandas as pd
 import os

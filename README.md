@@ -16,13 +16,19 @@ Sponsors/
 │   ├── coupon_usage_report.py   # Build sponsor coupon vs summary counts
 │   └── README.md
 │
-├── Reachout/           # FreeScout email automation
-│   ├── main.py                  # Main orchestration script
-│   ├── sponsor_reader.py        # Excel/CSV reading and processing
-│   ├── freescout_automation.py  # Browser automation logic
-│   ├── config.py                # Configuration settings
-│   ├── requirements.txt         # Python dependencies
-│   └── README.md                # Detailed documentation
+├── Reachout/           # FreeScout email automation (see Reachout/README.md)
+│   ├── main.py                  # CLI: send flow
+│   ├── extract_round_leads.py   # CLI: master → round CSV
+│   ├── build_approval_company_email_csv.py  # CLI: optional approval CSV helper
+│   ├── explore_freescout_selectors.py       # CLI: optional selector debugging
+│   ├── email_utils.py           # Used by extract_round_leads only
+│   ├── sponsor_reader.py        # Used by main only
+│   ├── freescout_automation.py  # Used by main + explore script
+│   ├── config.py                # Shared settings (imported by scripts above)
+│   ├── requirements.txt
+│   ├── .env.example
+│   ├── .python-version          # Optional pyenv pin
+│   └── README.md                # Scripts reference, inputs/outputs, data flow
 │
 ├── .gitignore          # Git ignore rules
 └── README.md           # This file
@@ -74,7 +80,7 @@ FREESCOUT_PASSWORD=your-password
 python main.py path/to/sponsors.xlsx
 ```
 
-See `Reachout/README.md` for detailed documentation.
+See **`Reachout/README.md`** for the full **scripts reference** (which files import which, input columns, round vs standard workflow, and optional tools).
 
 ### Admin — Camptix coupon report
 

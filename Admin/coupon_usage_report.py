@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Map sponsor tix_coupon to usage counts. Uses Camptix coupon summary CSV for counts."""
+"""
+Map sponsor tix_coupon rows to Camptix coupon-summary counts.
+
+Inputs/outputs and file patterns: Admin/README.md. Stdlib only; not imported by other repo code.
+"""
 
 import csv
 from pathlib import Path

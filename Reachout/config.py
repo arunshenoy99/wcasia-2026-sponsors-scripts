@@ -1,5 +1,9 @@
 """
-Configuration settings for FreeScout email automation
+Configuration settings for FreeScout email automation.
+
+Imported by main.py, sponsor_reader.py, freescout_automation.py,
+extract_round_leads.py, and explore_freescout_selectors.py.
+See Reachout/README.md for script map, input files, and env vars.
 """
 import os
 from dotenv import load_dotenv

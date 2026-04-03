@@ -1,5 +1,7 @@
 """
-Shared utilities for extracting email addresses from spreadsheet cell values.
+Extract emails from messy spreadsheet cells. Used only by extract_round_leads.py.
+
+See Reachout/README.md (round workflow, EMAIL_COLUMN_PRIORITY).
 """
 import re
 from typing import List

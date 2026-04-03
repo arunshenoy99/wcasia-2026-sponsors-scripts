@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Explore FreeScout conversation page and print element info for Reply button,
-reply editor, and Send button. Run this to get selectors that work on your instance.
+CLI: explore FreeScout conversation page — print element info for Reply, editor, Send (selector debugging).
+
+Standalone; uses freescout_automation login. Full context: Reachout/README.md (FreeScout selector section).
 
 Usage:
   python explore_freescout_selectors.py [search_email]

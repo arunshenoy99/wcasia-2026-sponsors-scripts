@@ -1,5 +1,7 @@
 """
-Browser automation module for FreeScout email sending
+Browser automation for FreeScout (used by main.py and explore_freescout_selectors.py).
+
+Requires .env credentials; see Reachout/README.md.
 """
 import time
 import re

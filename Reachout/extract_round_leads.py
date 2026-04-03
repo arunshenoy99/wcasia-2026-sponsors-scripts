@@ -1,7 +1,11 @@
 """
-Extract round lead list from 2026 Sponsor Prospects master file.
-Filters by status, optional date (e.g. Last Contact Date before a date), resolves email
-from Alternate Email v2 / Alternate Email / Email, and writes a round CSV for the send script.
+CLI: extract round lead list from the master prospects file.
+
+Filters by status (and optional date), resolves email via EMAIL_COLUMN_PRIORITY in config.py,
+writes a CSV for main.py. Uses email_utils for cell parsing.
+
+Input: master .xlsx / .xls / .csv. Output: round CSV (Email, Company Name, Contact Person, Template Name, …).
+See Reachout/README.md (round workflow, module map).
 """
 import argparse
 import os

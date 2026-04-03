@@ -44,6 +44,10 @@ venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
+### 3b. Python version (optional)
+
+If you use [pyenv](https://github.com/pyenv/pyenv) or similar, `Reachout/.python-version` pins a tested Python (e.g. `3.12.11`). It is optional; any Python that satisfies `requirements.txt` is fine.
+
 ### 4. Configure FreeScout Credentials
 
 Create a `.env` file in the `Reachout` folder:
@@ -66,31 +70,32 @@ BROWSER_DELAY_SCALE=1.0
 # OUTREACH_FILTER_VALUE=Your Name
 ```
 
-You can copy `.env.example` as a template:
+Copy `.env.example` to `.env` and edit (never commit `.env`):
 
 ```bash
 cp .env.example .env
 # Then edit .env with your credentials
 ```
 
-### 5. Prepare Excel File
+### 5. Input files for `main.py` (two workflows)
 
-Your Excel/CSV file should contain the following columns:
+**Workflow A — standard spreadsheet (template from Sales Strategy)**  
+`main.py` reads `.xlsx` / `.xls` / `.csv`. Required columns:
 
-- **Email** (required): Email address of the sponsor
-- **Company Name** (required): Company name for placeholders
-- **Contact Person** (required): Contact person name for placeholders
-- **Sales Strategy** (required): Dropdown column containing one of the following sponsor type values:
-  - "Past WCAsia Sponsor"
-  - "Past Flagship Sponsor"
-  - "Past Sponsor"
-  - "New WP"
-  - "New Non-WP"
-  - "Not WP Related"
+| Column | Purpose |
+|--------|---------|
+| **Company Name** | Placeholders, logging |
+| **Contact Person** | Placeholders (including first name) |
+| Primary email column | Default name **`Email`**; override with `EXCEL_EMAIL_COLUMN` in `.env` if your export uses another header (e.g. `Alternate Emails`) |
+| **Sales Strategy** | Must contain sponsor-type values that map to FreeScout templates (see **Template mapping** below) |
 
-**Notes:**
-- By default, **all rows** are processed (`FILTER_BY_OUTREACH = False` in `config.py`). To limit by assignee, set `FILTER_BY_OUTREACH = True` and set `OUTREACH_FILTER_VALUE` in `.env` (or `config.py`) to the exact value in the **Assigned Team Member** column.
-- If your file uses a different column for the primary email than **Email**, set `EXCEL_EMAIL_COLUMN` in `.env` (see `.env.example`).
+If **`Template Name`** is present on every data row, the reader treats the file as a **round CSV** and uses that column instead of looking up template from Sales Strategy.
+
+**Workflow B — round CSV from `extract_round_leads.py`**  
+Input: your **master** Excel/CSV (prospects workbook). Output: a CSV with at least **Email**, **Company Name**, **Contact Person**, **Template Name** (and optional **Status**, **Sales Strategy**, **Assigned Team Member**). Feed that file to `main.py` the same way as workflow A.
+
+**Filtering by assignee (optional):**  
+By default all rows run (`FILTER_BY_OUTREACH = False` in `config.py`). To limit rows, set `FILTER_BY_OUTREACH = True` and set `OUTREACH_FILTER_VALUE` in `.env` to match **Assigned Team Member** exactly.
 
 ## Usage
 
@@ -110,41 +115,48 @@ python main.py
 
 ### Round workflow (status-based leads)
 
-For a round targeting specific statuses (e.g. "New - haven't been emailed", "First Email Sent"):
-
-1. **Extract** leads from the master file into a round CSV (filters by status, resolves email from Alternate Email v2 / Alternate Email / Email):
+1. **Extract** from the **master** file (`.xlsx` / `.xls` / `.csv`). The master must include:
+   - **`Status`** (configurable via `STATUS_COLUMN` in `config.py`) — empty cells are treated as *New - haven't been emailed* when that status is allowed.
+   - **`Company Name`**, **`Contact Person`** (names from `EXCEL_COLUMNS` in `config.py`).
+   - At least one of the email columns in `EMAIL_COLUMN_PRIORITY` (default: Alternate Email v2 → Alternate Email → Email).
 
    ```bash
-   python extract_round_leads.py "path/to/2026 Sponsor Prospects - Assigning Roles v2.xlsx" [-o round_leads.csv]
+   python extract_round_leads.py "path/to/master.xlsx" -o round_leads.csv
+   # Optional: single status, or date filter on Last Contact Date
+   python extract_round_leads.py "path/to/master.xlsx" -s "First Email Sent" -o round_first.csv
+   python extract_round_leads.py "path/to/master.xlsx" --before-date 2026-02-01 -o round_stale.csv
    ```
 
-2. **Send** using the round CSV (file already has Template Name; no Sales Strategy lookup):
+2. **Send** with `main.py` using the round CSV as the only argument (round file includes **Template Name**):
 
    ```bash
    python main.py round_leads.csv
    ```
 
-Configure status-to-template mapping and email column priority in `config.py` (`STATUS_TO_TEMPLATE`, `EMAIL_COLUMN_PRIORITY`).
+Configure **`STATUS_TO_TEMPLATE`**, **`EMAIL_COLUMN_PRIORITY`**, and related keys in `config.py`.  
+**`email_utils.py`** is only used by `extract_round_leads.py` (parsing messy email cells); it is not run standalone.
 
 ### Approval list → company + email CSV (optional)
 
-Build a small CSV from **your local** approval export (paths are required; do not commit inputs/outputs that contain contact data):
+**Standalone** script (does not call `main.py` or FreeScout).  
+**Input (`-i`):** your CSV export from an internal approval list. Column names are detected flexibly (e.g. company/sponsor name + contact/email columns).  
+**Output (`-o`):** CSV with `Company Name`, `Email`, and `Listed on WCAsia 2026 site` (matched against the public sponsors list hardcoded in the script — update `PUBLISHED_SPONSORS` when the public page changes).
 
 ```bash
 python build_approval_company_email_csv.py -i path/to/approval_export.csv -o path/to/out.csv
 ```
 
-The script adds a column that checks company names against the public WordCamp Asia 2026 sponsors page list (maintain `PUBLISHED_SPONSORS` in the script as the public page changes).
+Do not commit input/output CSVs if they contain contact data.
 
 ### FreeScout selector debugging (optional)
 
-If reply/send selectors break on your instance, run (visible browser):
+**Standalone** helper: logs in with **`freescout_automation.py`**, opens a conversation, prints DOM hints for Reply / editor / Send. Use when your FreeScout skin breaks selectors.
 
 ```bash
-python explore_freescout_selectors.py
+python explore_freescout_selectors.py [search_email]
 ```
 
-Requires `.env` with FreeScout credentials. See docstring in that file.
+Requires `.env` with `FREESCOUT_URL`, `FREESCOUT_EMAIL`, `FREESCOUT_PASSWORD`. Browser stays visible; see file docstring for details.
 
 **To deactivate the virtual environment when done:**
 ```bash
@@ -240,23 +252,67 @@ Sponsor types are automatically mapped to FreeScout templates:
 - The tool looks for lines starting with "Subject -" in the template
 - If your templates use a different format, you may need to update the `extract_template_content()` method
 
-## File Structure
+## File structure and how everything is used
+
+### Typical data flow
+
+```
+Master prospects file (.xlsx / .csv)
+        │
+        │  extract_round_leads.py  (optional)
+        ▼
+Round CSV (Email, Company Name, Contact Person, Template Name, …)
+        │
+        │  main.py
+        ├──────────────────────► sponsor_reader.py  (parse rows, templates)
+        │
+        └──────────────────────► freescout_automation.py  (Selenium / FreeScout)
+```
+
+You can also point **`main.py`** directly at a standard spreadsheet (workflow A above) and skip `extract_round_leads.py`.
+
+### Entry-point scripts (run from CLI)
+
+| Script | Purpose | Typical inputs | Typical outputs |
+|--------|---------|----------------|-----------------|
+| **`main.py`** | Orchestrates send flow | Path to `.xlsx` / `.csv` (workflows A/B in **§5** above) | `logs/sent_emails_*.log`, emails in FreeScout |
+| **`extract_round_leads.py`** | Build round CSV from master | Master workbook path; optional `-o`, `-s`, `--before-date` | `round_YYYYMMDD.csv` or path from `-o` |
+| **`build_approval_company_email_csv.py`** | Company + email + public-site flag | `-i` approval CSV, `-o` output CSV | Written CSV only |
+| **`explore_freescout_selectors.py`** | Debug UI selectors | Optional search email; `.env` required | Console / browser inspection |
+
+### Shared modules (imported only — do not run directly)
+
+| File | Imported by | Role |
+|------|-------------|------|
+| **`config.py`** | `main.py`, `sponsor_reader.py`, `freescout_automation.py`, `extract_round_leads.py`, `explore_freescout_selectors.py` | Env-loaded settings, column names, template maps |
+| **`sponsor_reader.py`** | `main.py` | Load spreadsheet, resolve sponsor type / template, build row list |
+| **`freescout_automation.py`** | `main.py`, `explore_freescout_selectors.py` | Login, compose, templates, send / reply automation |
+| **`email_utils.py`** | `extract_round_leads.py` only | Parse multiple emails from one cell into one string |
+
+### Other tracked files
+
+| File | Role |
+|------|------|
+| **`requirements.txt`** | `pip install -r` dependencies |
+| **`.env.example`** | Copy to `.env`; documents optional vars |
+| **`.python-version`** | Optional pyenv pin |
+| **`README.md`** | This documentation |
 
 ```
 Reachout/
-├── main.py                       # Main orchestration script
-├── extract_round_leads.py        # Extract round CSV from master (status filter, email resolution)
-├── build_approval_company_email_csv.py  # Optional: company+email from approval CSV
-├── explore_freescout_selectors.py     # Optional: debug UI selectors
-├── email_utils.py                # Shared email extraction from cell values
-├── sponsor_reader.py             # Excel/CSV reading and processing (supports round CSV)
-├── freescout_automation.py       # Browser automation logic
-├── config.py                     # Configuration settings
-├── requirements.txt              # Python dependencies
-├── .python-version               # Optional: pyenv / local Python pin
-├── .env                          # Your credentials (not in git)
-├── .env.example                  # Example environment file
-└── README.md                     # This file
+├── main.py
+├── extract_round_leads.py
+├── build_approval_company_email_csv.py
+├── explore_freescout_selectors.py
+├── email_utils.py
+├── sponsor_reader.py
+├── freescout_automation.py
+├── config.py
+├── requirements.txt
+├── .python-version
+├── .env.example
+├── .env                 # local only
+└── README.md
 ```
 
 ## Notes

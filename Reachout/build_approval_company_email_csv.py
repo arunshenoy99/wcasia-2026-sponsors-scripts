@@ -1,6 +1,7 @@
 """
-Build a CSV with Company Name and Email from a local approval-list export,
-and verify each company against names on the public sponsors page (see README).
+CLI: build Company Name + Email CSV from a local approval export; flag matches to the public sponsors page.
+
+Standalone (not used by main.py). Usage and data policy: Reachout/README.md (approval list section).
 """
 import argparse
 import csv
