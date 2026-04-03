@@ -56,6 +56,14 @@ FREESCOUT_PASSWORD=your-password
 # Optional settings
 HEADLESS_MODE=false
 BROWSER_WAIT_TIME=10
+# Speed: 1.0=normal, 0.5=faster, 0.4=fast (reduces fixed waits between actions)
+BROWSER_DELAY_SCALE=1.0
+
+# Optional: if your sheet uses a different primary email column (default is "Email")
+# EXCEL_EMAIL_COLUMN=Alternate Emails
+
+# Optional: only when FILTER_BY_OUTREACH=true in config.py — must match "Assigned Team Member" in the sheet
+# OUTREACH_FILTER_VALUE=Your Name
 ```
 
 You can copy `.env.example` as a template:
@@ -80,10 +88,9 @@ Your Excel/CSV file should contain the following columns:
   - "New Non-WP"
   - "Not WP Related"
 
-**Note:** 
-- The tool automatically filters to only process rows where "Assigned Team Member" = "Arun"
-- Other columns like "WordCamps Sponsored" are ignored by the tool
-- To change this filter, edit `FILTER_BY_OUTREACH` and `OUTREACH_FILTER_VALUE` in `config.py`
+**Notes:**
+- By default, **all rows** are processed (`FILTER_BY_OUTREACH = False` in `config.py`). To limit by assignee, set `FILTER_BY_OUTREACH = True` and set `OUTREACH_FILTER_VALUE` in `.env` (or `config.py`) to the exact value in the **Assigned Team Member** column.
+- If your file uses a different column for the primary email than **Email**, set `EXCEL_EMAIL_COLUMN` in `.env` (see `.env.example`).
 
 ## Usage
 
@@ -100,6 +107,44 @@ Or run without arguments to be prompted for the file path:
 ```bash
 python main.py
 ```
+
+### Round workflow (status-based leads)
+
+For a round targeting specific statuses (e.g. "New - haven't been emailed", "First Email Sent"):
+
+1. **Extract** leads from the master file into a round CSV (filters by status, resolves email from Alternate Email v2 / Alternate Email / Email):
+
+   ```bash
+   python extract_round_leads.py "path/to/2026 Sponsor Prospects - Assigning Roles v2.xlsx" [-o round_leads.csv]
+   ```
+
+2. **Send** using the round CSV (file already has Template Name; no Sales Strategy lookup):
+
+   ```bash
+   python main.py round_leads.csv
+   ```
+
+Configure status-to-template mapping and email column priority in `config.py` (`STATUS_TO_TEMPLATE`, `EMAIL_COLUMN_PRIORITY`).
+
+### Approval list → company + email CSV (optional)
+
+Build a small CSV from **your local** approval export (paths are required; do not commit inputs/outputs that contain contact data):
+
+```bash
+python build_approval_company_email_csv.py -i path/to/approval_export.csv -o path/to/out.csv
+```
+
+The script adds a column that checks company names against the public WordCamp Asia 2026 sponsors page list (maintain `PUBLISHED_SPONSORS` in the script as the public page changes).
+
+### FreeScout selector debugging (optional)
+
+If reply/send selectors break on your instance, run (visible browser):
+
+```bash
+python explore_freescout_selectors.py
+```
+
+Requires `.env` with FreeScout credentials. See docstring in that file.
 
 **To deactivate the virtual environment when done:**
 ```bash
@@ -146,7 +191,8 @@ The tool currently supports these placeholders in templates:
 - `[Company Name]` → Replaced with Company Name from Excel
 - `[Customer Company POC][Prospective Sponsor's Name]` → Replaced with Contact Person
 - `[Customer Company POC]` → Replaced with Contact Person
-- `[Prospective Sponsor's Name]` → Replaced with Contact Person
+- `[Prospective Sponsor's Name]` → Replaced with Contact Person (first name)
+- `{%customer.firstName%}` → Replaced with Contact Person's first name (FreeScout-style, used in follow-up template)
 
 Additional placeholders can be added by updating `PLACEHOLDER_MAPPINGS` in `config.py`.
 
@@ -156,12 +202,14 @@ Sponsor types are automatically mapped to FreeScout templates:
 
 | Sponsor Type | FreeScout Template |
 |-------------|-------------------|
-| Past WCAsia Sponsor | Past WCAsia Sponsors Outreach - 2026 Sponsors |
+| Past WCAsia Sponsor | Past Sponsors (Flagships & Local) Outreach - 2026 Sponsors |
 | Past Flagship Sponsor | Past Sponsors (Flagships & Local) Outreach - 2026 Sponsors |
 | Past Sponsor | Past Sponsors (Flagships & Local) Outreach - 2026 Sponsors |
 | New WP | New WP Outreach - 2026 Sponsors |
 | New Non-WP | Non-WP Outreach - 2026 Sponsors |
 | Not WP Related | Non-WP Outreach - 2026 Sponsors |
+
+(Edit `SPONSOR_TYPE_TO_TEMPLATE` in `config.py` if your FreeScout template names differ.)
 
 ## Troubleshooting
 
@@ -196,14 +244,19 @@ Sponsor types are automatically mapped to FreeScout templates:
 
 ```
 Reachout/
-├── main.py                 # Main orchestration script
-├── sponsor_reader.py       # Excel/CSV reading and processing
-├── freescout_automation.py # Browser automation logic
-├── config.py              # Configuration settings
-├── requirements.txt       # Python dependencies
-├── .env                  # Your credentials (not in git)
-├── .env.example          # Example environment file
-└── README.md             # This file
+├── main.py                       # Main orchestration script
+├── extract_round_leads.py        # Extract round CSV from master (status filter, email resolution)
+├── build_approval_company_email_csv.py  # Optional: company+email from approval CSV
+├── explore_freescout_selectors.py     # Optional: debug UI selectors
+├── email_utils.py                # Shared email extraction from cell values
+├── sponsor_reader.py             # Excel/CSV reading and processing (supports round CSV)
+├── freescout_automation.py       # Browser automation logic
+├── config.py                     # Configuration settings
+├── requirements.txt              # Python dependencies
+├── .python-version               # Optional: pyenv / local Python pin
+├── .env                          # Your credentials (not in git)
+├── .env.example                  # Example environment file
+└── README.md                     # This file
 ```
 
 ## Notes

@@ -12,6 +12,10 @@ Sponsors/
 │   ├── compare_docs.py          # Utility to compare documents
 │   └── inspect_doc.py           # Utility to inspect document structure
 │
+├── Admin/               # Camptix coupon usage helper (see Admin/README.md)
+│   ├── coupon_usage_report.py   # Build sponsor coupon vs summary counts
+│   └── README.md
+│
 ├── Reachout/           # FreeScout email automation
 │   ├── main.py                  # Main orchestration script
 │   ├── sponsor_reader.py        # Excel/CSV reading and processing
@@ -71,6 +75,15 @@ python main.py path/to/sponsors.xlsx
 ```
 
 See `Reachout/README.md` for detailed documentation.
+
+### Admin — Camptix coupon report
+
+Sponsor coupon codes vs Camptix summary counts (local CSVs only; see `Admin/README.md`):
+
+```bash
+cd Admin
+python3 coupon_usage_report.py
+```
 
 ## Requirements
 

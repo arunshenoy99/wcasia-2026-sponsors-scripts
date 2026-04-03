@@ -1,55 +1,82 @@
 """
-Main script to orchestrate FreeScout email automation
+Main script to orchestrate FreeScout email automation.
+
+Round workflow (status-based leads):
+  1. Extract round CSV: python extract_round_leads.py "path/to/2026 Sponsor Prospects - Assigning Roles v2.xlsx" [-o round_leads.csv]
+  2. Send emails:       python main.py round_leads.csv [--start-from N]
 """
+import argparse
 import sys
 import os
 import re
 from datetime import datetime
 from sponsor_reader import SponsorReader
 from freescout_automation import FreeScoutAutomation
-from config import FREESCOUT_URL, FREESCOUT_EMAIL, FREESCOUT_PASSWORD, FILTER_BY_OUTREACH, OUTREACH_FILTER_VALUE
+from config import (
+    FREESCOUT_URL,
+    FREESCOUT_EMAIL,
+    FREESCOUT_PASSWORD,
+    FILTER_BY_OUTREACH,
+    OUTREACH_FILTER_VALUE,
+    TEMPLATE_NAME_COLUMN,
+)
+
+
+def _is_browser_session_lost(exc: BaseException) -> bool:
+    """True if the exception indicates Chrome/WebDriver session is gone (connection refused, etc.)."""
+    msg = str(exc).lower()
+    return "connection refused" in msg or "max retries exceeded" in msg or "invalid session" in msg
 
 
 def main():
     """Main orchestration function"""
-    
+    parser = argparse.ArgumentParser(description="Send sponsor emails via FreeScout.")
+    parser.add_argument("excel_path", nargs="?", default=None, help="Path to round CSV (or Excel)")
+    parser.add_argument("--start-from", type=int, default=1, metavar="N", help="Start from sponsor index N (1-based). Use to resume after browser crash.")
+    args = parser.parse_args()
+
     # Check configuration
     if not FREESCOUT_URL or not FREESCOUT_EMAIL or not FREESCOUT_PASSWORD:
         print("Error: FreeScout configuration missing.")
         print("Please create a .env file with FREESCOUT_URL, FREESCOUT_EMAIL, and FREESCOUT_PASSWORD")
         sys.exit(1)
-    
-    # Get Excel file path
-    if len(sys.argv) > 1:
-        excel_path = sys.argv[1]
-    else:
-        excel_path = input("Enter path to Excel/CSV file: ").strip()
-    
+    if FILTER_BY_OUTREACH and not (OUTREACH_FILTER_VALUE or "").strip():
+        print("Error: FILTER_BY_OUTREACH is True but OUTREACH_FILTER_VALUE is empty.")
+        print("Set OUTREACH_FILTER_VALUE in .env or config.py to match Assigned Team Member in your sheet.")
+        sys.exit(1)
+
+    excel_path = args.excel_path or input("Enter path to Excel/CSV file: ").strip()
+    if not excel_path:
+        print("Error: No file path provided.")
+        sys.exit(1)
     if not os.path.exists(excel_path):
         print(f"Error: File not found: {excel_path}")
         sys.exit(1)
     
     # Read sponsor data
-    print("Reading sponsor data...")
     if FILTER_BY_OUTREACH:
         print(f"Filter: Only processing sponsors where 'Assigned Team Member' = '{OUTREACH_FILTER_VALUE}'")
     reader = SponsorReader(excel_path)
     try:
         reader.read_file()
-        sponsor_type_col = reader.identify_sponsor_type_column()
-        if not sponsor_type_col:
-            print("Warning: Could not automatically identify sponsor type column.")
-            print("Available columns:", list(reader.df.columns))
-            sponsor_type_col = input("Enter the column name containing sponsor types: ").strip()
-            reader.sponsor_type_column = sponsor_type_col
-        
+        # Round CSV (from extract_round_leads.py) has "Template Name" column; skip sponsor type lookup
+        if TEMPLATE_NAME_COLUMN not in reader.df.columns:
+            sponsor_type_col = reader.identify_sponsor_type_column()
+            if not sponsor_type_col:
+                print("Warning: Could not automatically identify sponsor type column.")
+                print("Available columns:", list(reader.df.columns))
+                sponsor_type_col = input("Enter the column name containing sponsor types: ").strip()
+                reader.sponsor_type_column = sponsor_type_col
         sponsors = reader.get_sponsors()
-        print(f"Found {len(sponsors)} sponsors to process.")
-        
+        start_from = max(1, int(args.start_from))
+        if start_from > 1:
+            sponsors = sponsors[start_from - 1:]
+            print(f"Resuming from index {start_from}: {len(sponsors)} sponsors to process.")
+        else:
+            print(f"Found {len(sponsors)} sponsors to process.")
         if len(sponsors) == 0:
             print("No sponsors found. Exiting.")
             sys.exit(0)
-        
     except Exception as e:
         print(f"Error reading sponsor data: {e}")
         sys.exit(1)
@@ -72,17 +99,26 @@ def main():
     log_filepath = os.path.join(log_dir, log_filename)
     
     def parse_emails(email_str):
-        """Parse multiple emails from a string"""
+        """Parse multiple emails from a string. Strips leading 'CC:', 'BCC:', 'To:' from each part."""
         if not email_str:
             return []
         if ',' in email_str:
-            emails = [e.strip() for e in email_str.split(',')]
+            parts = [e.strip() for e in email_str.split(',')]
         elif ';' in email_str:
-            emails = [e.strip() for e in email_str.split(';')]
+            parts = [e.strip() for e in email_str.split(';')]
         else:
-            emails = [email_str.strip()]
-        # Filter valid emails (basic check for @)
-        return [e for e in emails if e and '@' in e]
+            parts = [email_str.strip()]
+        result = []
+        for part in parts:
+            if not part or '@' not in part:
+                continue
+            for prefix in ('CC:', 'BCC:', 'To:', 'Cc:', 'Bcc:'):
+                if part.upper().startswith(prefix.upper()):
+                    part = part[len(prefix):].strip()
+                    break
+            if part and '@' in part:
+                result.append(part)
+        return result
     
     def log_sent_email(email_addresses, company_name, template_name, status="SUCCESS"):
         """Log sent email to file"""
@@ -94,12 +130,8 @@ def main():
     print(f"\n📝 Log file: {log_filepath}")
     
     try:
-        print("\nSetting up browser...")
         automation.setup_browser()
-        
-        print("Logging in to FreeScout...")
         automation.login()
-        print("✓ Login successful")
         # Page should already be loaded, no need to wait
         
         # Process each sponsor
@@ -134,9 +166,14 @@ def main():
             except Exception as e:
                 print(f"Error: {e}")
                 failure_count += 1
-                # Log failure
                 log_sent_email(email_addresses, sponsor['company_name'], sponsor['template_name'], f"FAILED: {str(e)[:100]}")
-            
+                if _is_browser_session_lost(e):
+                    next_index = (args.start_from - 1) + i + 1
+                    print("\n*** Browser session lost (Chrome may have closed or crashed). ***")
+                    print("Restart the script and use --start-from to resume from the next sponsor.")
+                    print(f"  Example: python main.py {excel_path!r} --start-from {next_index}")
+                    break
+
             # No delay needed between emails - process immediately
         
         # Summary

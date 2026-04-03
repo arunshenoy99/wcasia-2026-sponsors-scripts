@@ -14,8 +14,39 @@ from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from webdriver_manager.chrome import ChromeDriverManager
-from typing import Dict, Optional, Tuple
-from config import FREESCOUT_URL, FREESCOUT_EMAIL, FREESCOUT_PASSWORD, HEADLESS_MODE, BROWSER_WAIT_TIME
+import urllib.parse
+from typing import Dict, List, Optional, Tuple
+
+from config import (
+    FREESCOUT_URL,
+    FREESCOUT_EMAIL,
+    FREESCOUT_PASSWORD,
+    HEADLESS_MODE,
+    BROWSER_WAIT_TIME,
+    BROWSER_DELAY_SCALE,
+    REPLY_TO_THREAD_TEMPLATE_PATTERN,
+)
+
+
+def _delay(sec: float) -> None:
+    """Sleep for sec * BROWSER_DELAY_SCALE (min 0.05s). Use for UI-settle waits so runs can be sped up via .env."""
+    time.sleep(max(0.05, sec * BROWSER_DELAY_SCALE))
+
+
+def _name_from_email(email_str: str) -> Tuple[str, str]:
+    """Derive display name from email: local part before @, split by . _ -, capitalize. Returns (full_name, first_name)."""
+    if not email_str or "@" not in email_str:
+        return "", ""
+    local = email_str.split("@")[0].strip()
+    if not local:
+        return "", ""
+    parts = re.split(r"[._-]+", local)
+    parts = [p.capitalize() for p in parts if p]
+    if not parts:
+        return "", ""
+    first = parts[0]
+    full = " ".join(parts)
+    return full, first
 
 
 class FreeScoutAutomation:
@@ -36,7 +67,7 @@ class FreeScoutAutomation:
         chrome_options.add_argument("--disable-blink-features=AutomationControlled")
         chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
         chrome_options.add_experimental_option('useAutomationExtension', False)
-        
+
         service = Service(ChromeDriverManager().install())
         self.driver = webdriver.Chrome(service=service, options=chrome_options)
         self.driver.maximize_window()
@@ -48,7 +79,7 @@ class FreeScoutAutomation:
             raise ValueError("FREESCOUT_URL not configured. Please set it in .env file.")
         
         self.driver.get(FREESCOUT_URL)
-        time.sleep(2)  # Wait for page load
+        _delay(2)  # Wait for page load
         
         # Wait for login form and fill credentials
         try:
@@ -75,7 +106,7 @@ class FreeScoutAutomation:
             
             email_field.clear()
             email_field.send_keys(FREESCOUT_EMAIL)
-            time.sleep(0.5)
+            _delay(0.5)
             
             # Find password field
             password_selectors = [
@@ -98,7 +129,7 @@ class FreeScoutAutomation:
             
             password_field.clear()
             password_field.send_keys(FREESCOUT_PASSWORD)
-            time.sleep(0.5)
+            _delay(0.5)
             
             # Find and click login button
             login_selectors = [
@@ -136,17 +167,293 @@ class FreeScoutAutomation:
             if "login" in self.driver.current_url.lower():
                 raise Exception("Login may have failed. Please check credentials.")
             
-            print("Successfully logged in to FreeScout")
             
         except Exception as e:
             raise Exception(f"Login failed: {e}")
     
+    def _parse_emails(self, email_str: str) -> List[str]:
+        """Parse email string (comma/semicolon separated) into list of valid email addresses.
+        Strips leading 'CC:', 'BCC:', 'To:' from each part so values like
+        'a@x.com, CC: b@y.com' parse to ['a@x.com', 'b@y.com'].
+        """
+        if not email_str or email_str == 'N/A':
+            return []
+        s = str(email_str).strip()
+        if ',' in s:
+            parts = [e.strip() for e in s.split(',')]
+        elif ';' in s:
+            parts = [e.strip() for e in s.split(';')]
+        else:
+            parts = [s]
+        result = []
+        for part in parts:
+            if not part or '@' not in part:
+                continue
+            # Strip CC:/BCC:/To: prefix (case-insensitive)
+            for prefix in ('CC:', 'BCC:', 'To:', 'Cc:', 'Bcc:'):
+                if part.upper().startswith(prefix.upper()):
+                    part = part[len(prefix):].strip()
+                    break
+            if part and '@' in part:
+                result.append(part)
+        return result
+    
+    def _open_search_tabs_for_emails(self, emails: List[str]) -> List[str]:
+        """Open FreeScout search URL for each email in a new tab. Return list of new tab handles in same order as emails. Switches back to original window."""
+        if not emails or not FREESCOUT_URL:
+            return []
+        base = FREESCOUT_URL.rstrip('/')
+        original_handle = self.driver.current_window_handle
+        new_handles = []
+        for email in emails:
+            handles_before = set(self.driver.window_handles)
+            url = f"{base}/search?q={urllib.parse.quote(email, safe='')}"
+            self.driver.execute_script("window.open(arguments[0], '_blank');", url)
+            _delay(0.4)
+            added = [h for h in self.driver.window_handles if h not in handles_before]
+            if added:
+                new_handles.append(added[-1])
+        self.driver.switch_to.window(original_handle)
+        _delay(0.5)
+        return new_handles
+    
+    def _close_search_tabs(self, tab_handles: List[str]) -> None:
+        """Close the given tab handles and switch back to the main window."""
+        if not tab_handles:
+            return
+        main_handle = self.driver.current_window_handle
+        for h in tab_handles:
+            try:
+                if h in self.driver.window_handles:
+                    self.driver.switch_to.window(h)
+                    self.driver.close()
+            except Exception:
+                pass
+        try:
+            if main_handle in self.driver.window_handles:
+                self.driver.switch_to.window(main_handle)
+            elif self.driver.window_handles:
+                self.driver.switch_to.window(self.driver.window_handles[0])
+            # Return to base FreeScout URL so next sponsor starts from a consistent state (avoids stuck on mailbox view)
+            if FREESCOUT_URL:
+                base = FREESCOUT_URL.rstrip('/')
+                self.driver.get(base)
+                _delay(1.5)
+        except Exception:
+            pass
+
+    def _is_conversation_link(self, href: str) -> bool:
+        """True if href looks like a conversation (not search, new-ticket, or mailbox root)."""
+        if not href or "search" in href or "new-ticket" in href or "new" in href.lower():
+            return False
+        path = href.split("?", 1)[0].rstrip("/")
+        segments = [s for s in path.split("/") if s]
+        if segments and segments[-1] == "mailbox":
+            return False
+        return True
+
+    def _switch_to_thread_tab_if_opened(self, handles_before_click: set) -> None:
+        """If a new tab was opened (e.g. conversation link with target=_blank), switch driver to it."""
+        for _ in range(6):
+            _delay(0.3)
+            now = self.driver.window_handles
+            new_handles = [h for h in now if h not in handles_before_click]
+            if new_handles:
+                self.driver.switch_to.window(new_handles[-1])
+                _delay(0.5)
+                return
+
+    def _open_first_thread_from_current_page(self) -> bool:
+        """On current page (must be search results), find first conversation link, click it, switch to new tab if opened. Returns True if thread opened."""
+        first_conversation_selectors = [
+            "table tbody tr a[href*='/conversations/']",
+            "table tbody tr a[href*='/ticket/']",
+            ".conv-list a[href*='/conversations/']",
+            ".conversation-list a[href*='/conversations/']",
+            "a[href*='/conversations/']",
+            "a[href*='/ticket/']",
+            ".conv-list a",
+            ".conversation-list a",
+            "table tbody tr a",
+            "a[href*='conversation']",
+            "a[href*='/mailbox/']",
+        ]
+        first_conv_href = None
+        handles_before = set(self.driver.window_handles)
+        for selector in first_conversation_selectors:
+            try:
+                links = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                for link in links:
+                    href = (link.get_attribute("href") or "").strip()
+                    if not self._is_conversation_link(href):
+                        continue
+                    first_conv_href = href
+                    link.click()
+                    _delay(1)
+                    self._switch_to_thread_tab_if_opened(handles_before)
+                    if "search" not in self.driver.current_url:
+                        self._wait_for_conversation_view()
+                        return True
+                    break
+                if first_conv_href:
+                    break
+            except Exception:
+                continue
+        if first_conv_href and "search" in self.driver.current_url:
+            self.driver.get(first_conv_href)
+            _delay(1)
+            self._wait_for_conversation_view()
+            return True
+        try:
+            first_link = self.wait.until(
+                EC.element_to_be_clickable((By.XPATH, "//a[contains(@href,'/conversations/') or contains(@href,'/ticket/')][1]"))
+            )
+            first_conv_href = first_link.get_attribute("href")
+            if first_conv_href and self._is_conversation_link(first_conv_href):
+                first_link.click()
+                _delay(1)
+                self._switch_to_thread_tab_if_opened(handles_before)
+                if "search" in self.driver.current_url:
+                    self.driver.get(first_conv_href)
+                    _delay(1)
+                self._wait_for_conversation_view()
+                return True
+        except Exception:
+            pass
+        return False
+
+    def open_thread_for_email(self, email: str, already_on_search_page: bool = False) -> bool:
+        """Navigate to search for email (unless already_on_search_page), open the first conversation. FreeScout may open in new tab; we switch to it."""
+        if not already_on_search_page:
+            if not FREESCOUT_URL or not email or "@" not in email:
+                return False
+            base = FREESCOUT_URL.rstrip("/")
+            url = f"{base}/search?q={urllib.parse.quote(email, safe='')}"
+            self.driver.get(url)
+            _delay(1)
+        return self._open_first_thread_from_current_page()
+
+    def _wait_for_conversation_view(self) -> None:
+        """Wait for the conversation (thread) view to load so reply editor/buttons are available."""
+        for _ in range(15):
+            try:
+                url = self.driver.current_url.lower()
+                if "conversation" in url or "ticket" in url:
+                    break
+            except Exception:
+                pass
+            _delay(0.3)
+        # Wait for something that exists only on conversation view (reply icon or reply form)
+        try:
+            self.wait.until(EC.presence_of_element_located(
+                (By.CSS_SELECTOR, "span.conv-reply, .note-editable, [aria-label='Reply']")
+            ))
+        except Exception:
+            pass
+        _delay(0.5)
+
+    def open_reply_form(self) -> None:
+        """Click the Reply control to open/expand the reply form so the reply editor is visible."""
+        reply_btn_selectors = [
+            "span.conv-reply.conv-action[aria-label='Reply']",
+            "span.conv-reply[aria-label='Reply']",
+            "[aria-label='Reply']",
+            "span.conv-reply.conv-action.glyphicon-share-alt",
+        ]
+        for selector in reply_btn_selectors:
+            try:
+                btn = self.wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, selector)))
+                self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
+                _delay(0.3)
+                try:
+                    btn.click()
+                except Exception:
+                    self.driver.execute_script("arguments[0].click();", btn)
+                _delay(1)
+                return
+            except Exception:
+                continue
+        raise Exception("Could not find Reply button to open reply form.")
+
+    def focus_reply_editor_and_fill(self, body: str) -> None:
+        """In the open conversation view, find the visible reply editor (after Reply was clicked), clear it, and set body."""
+        reply_editor_selectors = [
+            "div.note-editable[contenteditable='true']",
+            "div[contenteditable='true']",
+            ".note-editable",
+            ".reply-form div[contenteditable='true']",
+            "#reply-body",
+            "textarea[name*='body']",
+            "textarea.reply-body",
+        ]
+        for selector in reply_editor_selectors:
+            try:
+                try:
+                    el = self.wait.until(EC.visibility_of_element_located((By.CSS_SELECTOR, selector)))
+                except Exception:
+                    els = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                    el = next((e for e in els if e.is_displayed()), els[0] if els else None)
+                if not el:
+                    continue
+                el.click()
+                _delay(0.3)
+                if el.tag_name == "textarea":
+                    el.clear()
+                    el.send_keys(html.unescape(re.sub(r"<[^>]+>", "", body)))
+                else:
+                    self.driver.execute_script("arguments[0].innerHTML = arguments[1];", el, body)
+                return
+            except Exception:
+                continue
+        raise Exception("Could not find reply editor in conversation view.")
+
+    def click_send_reply(self) -> None:
+        """Find and click the visible Send button (btn-send-text sends the reply; multiple may exist, one visible)."""
+        send_selectors = [
+            "button.btn-send-text",
+            "button.btn-reply-submit.btn-send-text",
+            "button[type='submit']",
+            "button.btn-reply-submit",
+            "button.btn-primary",
+        ]
+        for selector in send_selectors:
+            try:
+                els = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                btn = next((e for e in els if e.is_displayed()), None)
+                if not btn:
+                    continue
+                self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
+                _delay(0.3)
+                try:
+                    btn.click()
+                except Exception:
+                    self.driver.execute_script("arguments[0].click();", btn)
+                _delay(1)
+                return
+            except Exception:
+                continue
+        try:
+            buttons = self.driver.find_elements(
+                By.XPATH,
+                "//button[contains(.,'Send') or contains(.,'Reply')] | //input[@type='submit' and (@value='Send' or @value='Reply' or contains(@value,'Send'))]",
+            )
+            btn = next((b for b in buttons if b.is_displayed()), None)
+            if btn:
+                self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
+                _delay(0.2)
+                try:
+                    btn.click()
+                except Exception:
+                    self.driver.execute_script("arguments[0].click();", btn)
+                _delay(1)
+                return
+        except Exception:
+            pass
+        raise Exception("Could not find Send/Reply button in conversation view.")
+    
     def click_new_conversation(self):
         """Click the mail icon/new conversation button"""
         try:
-            print("Looking for 'New Conversation' button...")
-            print(f"Current URL: {self.driver.current_url}")
-            
             # Wait for page to fully load after login (use WebDriverWait)
             try:
                 self.wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "body")))
@@ -177,31 +484,20 @@ class FreeScoutAutomation:
             new_button = None
             for selector in new_conversation_selectors:
                 try:
-                    print(f"  Trying selector: {selector[:60]}...")
                     if selector.startswith("//"):
-                        # XPath selector
                         new_button = self.wait.until(EC.element_to_be_clickable((By.XPATH, selector)))
                     else:
-                        # CSS selector
                         new_button = self.wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, selector)))
-                    
                     if new_button:
-                        print(f"  ✓ Found button with selector: {selector[:60]}")
                         break
-                except Exception as e:
-                    print(f"  ✗ Not found: {str(e)[:60]}")
+                except Exception:
                     continue
             
             if not new_button:
-                # Try finding by icon (FreeScout uses glyphicon-envelope)
-                print("  Trying to find by icon (glyphicon-envelope)...")
                 try:
-                    # Find the icon and get its parent <a> tag
                     icon = self.driver.find_element(By.CSS_SELECTOR, "i.glyphicon.glyphicon-envelope")
                     new_button = icon.find_element(By.XPATH, "./ancestor::a")
-                    print("  ✓ Found by icon")
-                except:
-                    print("  ✗ Not found by icon")
+                except Exception:
                     pass
             
             if not new_button:
@@ -228,187 +524,170 @@ class FreeScoutAutomation:
                 for selector in manual_selectors:
                     try:
                         new_button = self.driver.find_element(By.XPATH, selector)
-                        print(f"✓ Found with manual selector: {selector}")
                         break
-                    except:
+                    except Exception:
                         continue
                 
                 if not new_button:
                     raise Exception("Could not find new conversation button. Please check FreeScout interface or update selectors.")
             
-            print("Clicking new conversation button...")
             new_button.click()
-            # Wait for compose window to open (use WebDriverWait instead of fixed sleep)
             try:
                 self.wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "input.select2-search__field, #subject, div.note-editable")))
-            except:
-                pass  # Form is likely already loaded
-            print("✓ New conversation window should be open")
+            except Exception:
+                pass
+            # Dismiss any assignee dropdown so we don't interact with it when filling To
+            try:
+                ActionChains(self.driver).send_keys(Keys.ESCAPE).perform()
+                _delay(0.5)
+            except Exception:
+                pass
             
         except Exception as e:
             raise Exception(f"Failed to click new conversation: {e}")
     
+    def _get_to_field_select2_container(self):
+        """Find the Select2 container for the To/recipient field (not assignee). Returns (container, input) or (None, None)."""
+        # FreeScout new conversation form has Assignee first, then To. Target To specifically.
+        # 1) Try: find the row that has "To" or "Recipient" label, then get Select2 inside it
+        try:
+            row = self.driver.find_element(
+                By.XPATH,
+                "//label[contains(.,'To') or contains(.,'Recipient') or contains(.,'Customer')]/ancestor::div[contains(@class,'form-group') or contains(@class,'row')][1]"
+            )
+            container = row.find_element(By.CSS_SELECTOR, ".select2-container, span.select2-container")
+            inp = row.find_element(By.CSS_SELECTOR, "input.select2-search__field")
+            if container and inp:
+                return container, inp
+        except Exception:
+            pass
+        # 2) Try: find select that is for To/recipient (name often 'to' or 'customer_id'), then its Select2 wrapper
+        for name in ("to", "customer_id", "customer"):
+            try:
+                sel = self.driver.find_element(By.CSS_SELECTOR, f"select[name='{name}'], select[id*='{name}']")
+                container = self.driver.execute_script(
+                    "var s = arguments[0]; return s.nextElementSibling && s.nextElementSibling.classList && s.nextElementSibling.classList.contains('select2-container') ? s.nextElementSibling : null;",
+                    sel,
+                )
+                if container:
+                    inp = container.find_element(By.CSS_SELECTOR, "input.select2-search__field")
+                    return container, inp
+            except Exception:
+                continue
+        # 3) Fallback: use the second Select2 on the page (first is often assignee)
+        try:
+            containers = self.driver.find_elements(By.CSS_SELECTOR, ".select2-container, span.select2-container")
+            if len(containers) >= 2:
+                container = containers[1]
+                container.click()
+                _delay(0.2)
+                inp = self.driver.find_element(By.CSS_SELECTOR, "input.select2-search__field")
+                return container, inp
+        except Exception:
+            pass
+        return None, None
+
     def fill_to_field(self, email: str):
         """
         Fill the 'To' field with email address(es) (Select2 dropdown)
-        Supports multiple emails separated by comma, semicolon, or space
+        Supports multiple emails separated by comma, semicolon, or space.
+        Targets the To/recipient field specifically (not the assignee dropdown).
         """
-        import re
-        
         try:
-            # Parse multiple emails from the email string
-            # Split by comma, semicolon, or whitespace (but preserve email format)
-            # Common patterns: "email1@example.com, email2@example.com" or "email1@example.com; email2@example.com"
-            email_string = str(email).strip()
-            
-            # Split by comma or semicolon first (most common)
-            if ',' in email_string:
-                emails = [e.strip() for e in email_string.split(',')]
-            elif ';' in email_string:
-                emails = [e.strip() for e in email_string.split(';')]
-            else:
-                # Try splitting by whitespace, but be careful not to split email addresses
-                # Only split if there are multiple @ symbols (indicating multiple emails)
-                if email_string.count('@') > 1:
-                    # Split by whitespace, but keep email addresses together
-                    emails = re.split(r'\s+', email_string)
-                    # Filter out empty strings and validate basic email format
-                    emails = [e.strip() for e in emails if e.strip() and '@' in e]
-                else:
-                    # Single email
-                    emails = [email_string]
-            
-            # Clean and validate emails
-            valid_emails = []
-            for e in emails:
-                e = e.strip()
-                if e and '@' in e:  # Basic validation
-                    valid_emails.append(e)
-            
+            # Parse multiple emails (reuse _parse_emails so CC:/BCC:/To: are stripped)
+            valid_emails = self._parse_emails(email)
             if not valid_emails:
-                raise Exception(f"No valid email addresses found in: {email_string}")
+                raise Exception(f"No valid email addresses found in: {email}")
             
-            print(f"Found {len(valid_emails)} email address(es): {', '.join(valid_emails)}")
-            
-            # Find Select2 container and input field (only need to do this once)
-            print("Looking for 'To' field (Select2)...")
-            
-            # FreeScout uses Select2 for the To field
-            # First, find the Select2 container
-            select2_selectors = [
-                ".select2-container",
-                "span.select2-container",
-                ".select2-selection",
-                "span.select2-selection"
-            ]
-            
-            select2_container = None
-            for selector in select2_selectors:
-                try:
-                    select2_container = self.wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, selector)))
-                    if select2_container:
-                        print(f"  ✓ Found Select2 container")
+            # Find To field specifically (avoid assignee Select2)
+            select2_container, to_field = self._get_to_field_select2_container()
+            if not to_field:
+                # Legacy fallback: prefer second Select2 (first is often assignee in new-conversation form)
+                all_containers = self.driver.find_elements(By.CSS_SELECTOR, ".select2-container, span.select2-container")
+                if len(all_containers) >= 2:
+                    select2_container = all_containers[1]
+                else:
+                    select2_container = None
+                    for sel in [".select2-container", "span.select2-container", ".select2-selection", "span.select2-selection"]:
+                        try:
+                            select2_container = self.wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, sel)))
+                            break
+                        except Exception:
+                            continue
+                for sel in ["input.select2-search__field", ".select2-search__field", "input.select2-search input"]:
+                    try:
+                        to_field = self.wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, sel)))
                         break
-                except:
-                    continue
-            
-            # Find the search input field
-            to_field = None
-            to_selectors = [
-                "input.select2-search__field",  # FreeScout specific
-                ".select2-search__field",
-                "input.select2-search input",
-                "input[role='textbox'][aria-autocomplete='list']"
-            ]
-            
-            for selector in to_selectors:
-                try:
-                    to_field = self.wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, selector)))
-                    if to_field:
-                        print(f"  ✓ Found To field")
-                        break
-                except:
-                    continue
+                    except Exception:
+                        continue
             
             if not to_field:
                 raise Exception("Could not find 'To' field. Please check FreeScout interface.")
             
+            to_selectors = ["input.select2-search__field", ".select2-search__field", "input.select2-search input"]
+            select2_selectors = [".select2-container", "span.select2-container", ".select2-selection", "span.select2-selection"]
+            
             # Add each email address
             for i, email_addr in enumerate(valid_emails, 1):
-                print(f"  Adding email {i}/{len(valid_emails)}: {email_addr}")
-                
-                # For each email (including first), click Select2 container to open/focus the field
-                # This is needed because after adding an email, Select2 closes and we need to reopen it
-                # Re-find the container for each email in case DOM changed
-                select2_container_current = None
-                for selector in select2_selectors:
-                    try:
-                        select2_container_current = WebDriverWait(self.driver, 1).until(
-                            EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
-                        )
-                        if select2_container_current:
+                # Use the To field's container (avoid clicking assignee)
+                container_to_use = select2_container
+                if not container_to_use:
+                    for selector in select2_selectors:
+                        try:
+                            container_to_use = WebDriverWait(self.driver, 1).until(
+                                EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
+                            )
                             break
-                    except:
-                        continue
-                
-                if select2_container_current:
+                        except Exception:
+                            continue
+                if container_to_use:
                     try:
-                        select2_container_current.click()
-                        time.sleep(0.2)  # Small wait for dropdown to open
-                    except:
+                        container_to_use.click()
+                        _delay(0.2)
+                    except Exception:
                         pass
                 
-                # Find the input field again (it might have been recreated after adding previous email)
+                # Find the input field again (recreated after adding previous email)
                 to_field = None
-                for selector in to_selectors:
+                if select2_container:
                     try:
-                        to_field = WebDriverWait(self.driver, 1).until(
-                            EC.presence_of_element_located((By.CSS_SELECTOR, selector))
-                        )
-                        if to_field:
+                        to_field = select2_container.find_element(By.CSS_SELECTOR, "input.select2-search__field")
+                    except Exception:
+                        pass
+                if not to_field:
+                    for selector in to_selectors:
+                        try:
+                            to_field = WebDriverWait(self.driver, 1).until(
+                                EC.presence_of_element_located((By.CSS_SELECTOR, selector))
+                            )
                             break
-                    except:
-                        continue
-                
+                        except Exception:
+                            continue
                 if not to_field:
                     raise Exception("Could not find 'To' field after opening Select2.")
                 
-                # Type the email (don't clear - the field should be empty when opened)
                 to_field.send_keys(email_addr)
-                
-                # Wait for Select2 to process
                 try:
                     WebDriverWait(self.driver, 1).until(
                         EC.presence_of_element_located((By.CSS_SELECTOR, ".select2-results__option, .select2-selection__choice"))
                     )
-                except:
-                    pass  # Continue anyway
-                
-                # Try to select from dropdown or press Enter
+                except Exception:
+                    pass
                 try:
                     option = WebDriverWait(self.driver, 1).until(
                         EC.element_to_be_clickable((By.CSS_SELECTOR, ".select2-results__option--highlighted, .select2-results__option"))
                     )
                     option.click()
-                    print(f"    ✓ Selected {email_addr} from dropdown")
-                except:
-                    # If no dropdown option, just press Enter to confirm
+                except Exception:
                     to_field.send_keys(Keys.RETURN)
-                    print(f"    ✓ Confirmed {email_addr} with Enter")
-                
-                # Small wait between emails to ensure Select2 processes each one
                 if i < len(valid_emails):
-                    time.sleep(0.3)
+                    _delay(0.3)
             
-            # After adding all emails, ensure Select2 dropdown is closed
-            # Press Escape to close any open Select2 dropdown
             try:
                 ActionChains(self.driver).send_keys(Keys.ESCAPE).perform()
-                time.sleep(0.2)
-            except:
+                _delay(0.2)
+            except Exception:
                 pass
-            
-            print(f"✓ To field filled with {len(valid_emails)} email address(es)")
             
         except Exception as e:
             raise Exception(f"Failed to fill 'To' field: {e}")
@@ -416,7 +695,6 @@ class FreeScoutAutomation:
     def add_tag(self, tag_name: str):
         """Add a tag to the conversation"""
         try:
-            print(f"Adding tag: {tag_name}...")
             
             # Find and click the tag icon
             tag_icon_selectors = [
@@ -431,18 +709,16 @@ class FreeScoutAutomation:
                 try:
                     tag_icon = self.wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, selector)))
                     if tag_icon:
-                        print(f"  ✓ Found tag icon")
                         break
                 except:
                     continue
             
             if not tag_icon:
-                print("  ⚠️  Could not find tag icon, skipping tag addition")
                 return
             
             # Click the tag icon to open dropdown
             tag_icon.click()
-            time.sleep(0.3)  # Wait for dropdown to open
+            _delay(0.3)  # Wait for dropdown to open
             
             # Find the tag dropdown container first to scope all searches
             tag_dropdown = None
@@ -450,13 +726,11 @@ class FreeScoutAutomation:
                 tag_dropdown = WebDriverWait(self.driver, 2).until(
                     EC.presence_of_element_located((By.CSS_SELECTOR, "#add-tag-wrap"))
                 )
-                print(f"  ✓ Found tag dropdown container")
-            except:
-                print("  ⚠️  Could not find tag dropdown container, skipping tag addition")
+            except Exception:
                 return
             
             # Wait a bit for Select2 to initialize
-            time.sleep(0.5)
+            _delay(0.5)
             
             # Try to find and click the Select2 container or selection area to open/focus
             # Try multiple approaches to open the Select2
@@ -465,25 +739,22 @@ class FreeScoutAutomation:
                 # Approach 1: Find Select2 container within tag dropdown
                 tag_select2_container = tag_dropdown.find_element(By.CSS_SELECTOR, ".select2-container, span.select2-container")
                 tag_select2_container.click()
-                print(f"  ✓ Clicked Select2 container")
                 select2_opened = True
-                time.sleep(0.3)
+                _delay(0.3)
             except:
                 try:
                     # Approach 2: Find Select2 selection area and click it
                     tag_select2_selection = tag_dropdown.find_element(By.CSS_SELECTOR, ".select2-selection")
                     tag_select2_selection.click()
-                    print(f"  ✓ Clicked Select2 selection area")
                     select2_opened = True
-                    time.sleep(0.3)
+                    _delay(0.3)
                 except:
                     try:
                         # Approach 3: Find the hidden select element and trigger Select2
                         hidden_select = tag_dropdown.find_element(By.CSS_SELECTOR, "select.tag-input")
                         self.driver.execute_script("arguments[0].dispatchEvent(new Event('select2:open'));", hidden_select)
-                        print(f"  ✓ Triggered Select2 open via JavaScript")
                         select2_opened = True
-                        time.sleep(0.3)
+                        _delay(0.3)
                     except:
                         pass
             
@@ -504,8 +775,7 @@ class FreeScoutAutomation:
                     )
                     # Verify it's actually in the tag dropdown
                     try:
-                        parent = tag_input.find_element(By.XPATH, "./ancestor::*[@id='add-tag-wrap' or contains(@class, 'conv-new-tag-dd')]")
-                        print(f"  ✓ Found tag input field (scoped to tag dropdown)")
+                        tag_input.find_element(By.XPATH, "./ancestor::*[@id='add-tag-wrap' or contains(@class, 'conv-new-tag-dd')]")
                         break
                     except:
                         # If not in tag dropdown, continue to next selector
@@ -515,28 +785,27 @@ class FreeScoutAutomation:
                     continue
             
             if not tag_input:
-                print("  ⚠️  Could not find tag input field in dropdown, skipping tag addition")
                 return
             
             # Click the input to ensure it's focused
             try:
                 tag_input.click()
-                time.sleep(0.2)
+                _delay(0.2)
             except:
                 pass
             
             # Type the tag name
             tag_input.clear()
             tag_input.send_keys(tag_name)
-            time.sleep(0.5)  # Wait for Select2 to process and show results
+            _delay(0.5)  # Wait for Select2 to process and show results
             
             # Wait for Select2 results to appear
             try:
                 WebDriverWait(self.driver, 2).until(
                     EC.presence_of_element_located((By.CSS_SELECTOR, ".select2-results__option"))
                 )
-            except:
-                print("  ⚠️  Select2 results did not appear, but continuing...")
+            except Exception:
+                pass
             
             # Try to select from dropdown or press Enter
             # IMPORTANT: Only look for options that contain our tag name to avoid matching "To" field
@@ -558,10 +827,9 @@ class FreeScoutAutomation:
                 if option:
                     # Scroll option into view and click
                     self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", option)
-                    time.sleep(0.2)
+                    _delay(0.2)
                     option.click()
-                    print(f"  ✓ Selected {tag_name} from dropdown")
-                    time.sleep(0.5)  # Wait for selection to be processed
+                    _delay(0.5)
                 else:
                     raise Exception("Tag option not found in dropdown")
                 
@@ -572,22 +840,17 @@ class FreeScoutAutomation:
                     tag_chip = tag_select2_selection.find_element(By.CSS_SELECTOR, ".select2-selection__choice")
                     if tag_name in tag_chip.get_attribute('title') or tag_name in tag_chip.text:
                         tag_selected_in_select2 = True
-                        print(f"  ✓ Tag '{tag_name}' confirmed in Select2 selection")
                 except:
                     # Alternative: check if tag name appears in selection text
                     try:
                         tag_select2_selection = tag_dropdown.find_element(By.CSS_SELECTOR, ".select2-selection")
                         if tag_name in tag_select2_selection.text:
                             tag_selected_in_select2 = True
-                            print(f"  ✓ Tag '{tag_name}' confirmed in Select2 (by text)")
                     except:
                         pass
-            except Exception as e:
-                # If no dropdown option found, just press Enter
-                print(f"  ℹ️  No matching dropdown option found, using Enter key")
+            except Exception:
                 tag_input.send_keys(Keys.RETURN)
-                print(f"  ✓ Confirmed {tag_name} with Enter")
-                time.sleep(0.5)  # Wait for Enter to be processed
+                _delay(0.5)  # Wait for Enter to be processed
                 
                 # Check if tag was selected - scoped to tag dropdown
                 try:
@@ -598,10 +861,7 @@ class FreeScoutAutomation:
                 except:
                     pass
             
-            if not tag_selected_in_select2:
-                print(f"  ⚠️  Warning: Tag may not be selected in Select2 before clicking OK")
-            
-            time.sleep(0.3)
+            _delay(0.3)
             
             # Find and click the tick/ok button - MUST be within tag dropdown
             ok_button = None
@@ -612,7 +872,6 @@ class FreeScoutAutomation:
                 ok_button = WebDriverWait(self.driver, 2).until(
                     EC.element_to_be_clickable((By.CSS_SELECTOR, "#add-tag-wrap button.btn-default"))
                 )
-                print(f"  ✓ Found OK button directly")
             except:
                 try:
                     # Approach 2: Find by icon and get parent button
@@ -620,12 +879,10 @@ class FreeScoutAutomation:
                         EC.presence_of_element_located((By.CSS_SELECTOR, "#add-tag-wrap i.glyphicon-ok"))
                     )
                     ok_button = icon.find_element(By.XPATH, "./parent::button")
-                    print(f"  ✓ Found OK button via icon")
                 except:
                     try:
                         # Approach 3: Find any button in the dropdown
                         ok_button = self.driver.find_element(By.CSS_SELECTOR, ".conv-new-tag-dd button.btn-default")
-                        print(f"  ✓ Found OK button via dropdown")
                     except:
                         pass
             
@@ -633,26 +890,23 @@ class FreeScoutAutomation:
                 # Scroll into view
                 try:
                     self.driver.execute_script("arguments[0].scrollIntoView({block: 'center', behavior: 'instant'});", ok_button)
-                    time.sleep(0.3)
+                    _delay(0.3)
                 except:
                     pass
                 
                 # Try regular click first, then JavaScript as fallback
                 try:
                     ok_button.click()
-                    print(f"  ✓ Clicked OK button")
-                    time.sleep(0.5)  # Wait for tag to be saved
-                except Exception as e:
-                    # Fallback to JavaScript click
+                    _delay(0.5)
+                except Exception:
                     try:
                         self.driver.execute_script("arguments[0].click();", ok_button)
-                        print(f"  ✓ Clicked OK button via JavaScript")
-                        time.sleep(0.5)
-                    except Exception as js_e:
-                        print(f"  ⚠️  Could not click OK button: {js_e}")
+                        _delay(0.5)
+                    except Exception:
+                        pass
                 
                 # Verify tag was actually added by checking if it appears in the conversation tags
-                time.sleep(0.5)  # Wait for tag to be saved
+                _delay(0.5)  # Wait for tag to be saved
                 tag_added = False
                 try:
                     # Check if tag appears in the conversation tags area
@@ -682,7 +936,6 @@ class FreeScoutAutomation:
                             tag_name.lower() in elem_title.lower() or 
                             tag_name.lower() in elem_data_tag.lower()):
                             tag_added = True
-                            print(f"  ✓ Tag '{tag_name}' confirmed in conversation tags")
                             break
                     
                     if not tag_added:
@@ -690,35 +943,20 @@ class FreeScoutAutomation:
                         try:
                             dropdown = self.driver.find_element(By.CSS_SELECTOR, "#add-tag-wrap")
                             if not dropdown.is_displayed() or "display: none" in (dropdown.get_attribute("style") or ""):
-                                print(f"  ✓ Dropdown closed - tag likely saved")
                                 tag_added = True
-                        except:
+                        except Exception:
                             pass
-                    
-                    if not tag_added:
-                        print(f"  ⚠️  Warning: Could not verify tag was added. It may not have been saved.")
-                except Exception as verify_e:
-                    print(f"  ⚠️  Could not verify tag: {verify_e}")
-            else:
-                print("  ⚠️  Could not find OK button, tag may not be saved")
-            
-            if tag_added:
-                print(f"✓ Tag '{tag_name}' added successfully")
-            else:
-                print(f"⚠️  Tag '{tag_name}' may not have been added - please verify manually")
-            
-        except Exception as e:
-            print(f"  ⚠️  Warning: Could not add tag: {e}")
-            import traceback
-            traceback.print_exc()
-            # Don't raise exception - tag addition is not critical
+                except Exception:
+                    pass
+            # Don't raise - tag addition is not critical
+        except Exception:
+            pass
     
     def select_template(self, template_name: str):
         """Select template from dropdown (FreeScout Saved Replies)"""
         try:
-            print(f"Looking for template selector (searching for: '{template_name}')...")
-            
-            # FreeScout uses a button with dropdown for Saved Replies
+            # Use short wait for template UI (button + dropdown) so failed selectors don't block 10s each
+            quick_wait = WebDriverWait(self.driver, 2)
             template_button_selectors = [
                 "button[aria-label='Saved Replies']",  # FreeScout specific
                 "button.dropdown-toggle[data-toggle='dropdown']",
@@ -730,120 +968,88 @@ class FreeScoutAutomation:
             template_button = None
             for selector in template_button_selectors:
                 try:
-                    print(f"  Trying template button selector: {selector[:50]}...")
-                    template_button = self.wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, selector)))
+                    template_button = quick_wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, selector)))
                     if template_button:
-                        print(f"  ✓ Found template button with: {selector[:50]}")
                         break
-                except Exception as e:
-                    print(f"  ✗ Not found: {str(e)[:50]}")
+                except Exception:
                     continue
             
             if not template_button:
-                print("\n⚠️  Could not find template button automatically.")
                 raise Exception("Could not find template button.")
             
-            # Click the button to open the dropdown
-            print("  Clicking template button to open dropdown...")
             template_button.click()
-            # Wait for dropdown to open - use shorter timeout and visibility check
+            # Wait for dropdown to open
             try:
-                WebDriverWait(self.driver, 1).until(EC.visibility_of_element_located((By.CSS_SELECTOR, ".dropdown-menu.dropdown-saved-replies")))
-            except:
-                # If visibility check fails, try presence with small wait
+                WebDriverWait(self.driver, 0.8).until(EC.visibility_of_element_located((By.CSS_SELECTOR, ".dropdown-menu.dropdown-saved-replies")))
+            except Exception:
                 try:
-                    WebDriverWait(self.driver, 1).until(EC.presence_of_element_located((By.CSS_SELECTOR, ".dropdown-menu.dropdown-saved-replies")))
-                    time.sleep(0.1)  # Tiny wait for dropdown animation
-                except:
-                    pass  # Dropdown might already be open
+                    WebDriverWait(self.driver, 0.5).until(EC.presence_of_element_located((By.CSS_SELECTOR, ".dropdown-menu.dropdown-saved-replies")))
+                    _delay(0.05)
+                except Exception:
+                    pass
             
             template_link_selectors = [
-                f"//div[@class='dropdown-menu']//a[contains(text(), '{template_name}')]",  # XPath with exact match
-                f"//li/a[contains(text(), '{template_name}')]",  # Alternative XPath
-                f"a[data-value]:contains('{template_name}')"  # CSS (won't work, but keeping for reference)
+                f"//div[@class='dropdown-menu']//a[contains(text(), '{template_name}')]",
+                f"//li/a[contains(text(), '{template_name}')]",
+                f"a[data-value]:contains('{template_name}')"
             ]
             
             template_link = None
-            # Use shorter timeout for template link selection (2 seconds instead of 10)
-            short_wait = WebDriverWait(self.driver, 2)
+            short_wait = WebDriverWait(self.driver, 1.5)
             for selector in template_link_selectors:
                 try:
-                    print(f"  Trying template link selector: {selector[:60]}...")
                     if selector.startswith("//"):
                         template_link = short_wait.until(EC.element_to_be_clickable((By.XPATH, selector)))
                     else:
                         template_link = short_wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, selector)))
-                    
                     if template_link:
-                        print(f"  ✓ Found template link with: {selector[:60]}")
                         break
-                except Exception as e:
-                    # Don't print error for first selector - it's expected to try multiple
-                    if selector != template_link_selectors[0]:
-                        print(f"  ✗ Not found: {str(e)[:60]}")
+                except Exception:
                     continue
             
             if not template_link:
-                # Try a more flexible search - look for any link containing the template name
                 try:
-                    print(f"  Trying flexible search for template: '{template_name}'...")
-                    # Search in the dropdown menu
                     dropdown = self.driver.find_element(By.CSS_SELECTOR, ".dropdown-menu.dropdown-saved-replies")
                     template_link = dropdown.find_element(By.XPATH, f".//a[contains(text(), '{template_name}')]")
-                    print("  ✓ Found template link with flexible search")
-                except Exception as e:
-                    print(f"  ✗ Flexible search failed: {str(e)[:60]}")
+                except Exception:
                     raise Exception(f"Could not find template '{template_name}' in dropdown.")
-            
-            # Ensure template link is visible and clickable
-            print(f"  Clicking template: '{template_name}'...")
-            # Wait for element to be clickable
             try:
-                template_link = WebDriverWait(self.driver, 2).until(
+                template_link = WebDriverWait(self.driver, 1).until(
                     EC.element_to_be_clickable(template_link)
                 )
-            except:
-                # If not clickable, try scrolling into view
+            except Exception:
                 try:
                     self.driver.execute_script("arguments[0].scrollIntoView({block: 'center', behavior: 'instant'});", template_link)
-                    time.sleep(0.3)
-                except:
+                    _delay(0.2)
+                except Exception:
                     pass
             
-            # Try clicking - use JavaScript click as it's more reliable for dropdown items
             try:
-                # First try regular click
                 template_link.click()
-            except Exception as e:
-                # If regular click fails, use JavaScript click (more reliable for dropdown items)
-                print(f"  Regular click failed ({str(e)[:50]}), using JavaScript click...")
+            except Exception:
                 try:
                     self.driver.execute_script("arguments[0].click();", template_link)
                 except Exception as js_e:
-                    raise Exception(f"Could not click template link. Regular click: {e}. JavaScript click: {js_e}")
-            # Wait for template to load into editor (use WebDriverWait instead of fixed sleep)
+                    raise Exception(f"Could not click template link: {js_e}")
+            # Wait for template to load into editor (short timeout; returns as soon as content appears)
             body_selectors = [
                 "div.note-editable[contenteditable='true']",
                 "div[contenteditable='true']",
                 ".note-editable"
             ]
+            body_wait = WebDriverWait(self.driver, 1.2)
             for selector in body_selectors:
                 try:
-                    body_element = self.wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, selector)))
-                    # Wait for content to appear (not just empty) - use WebDriverWait
+                    body_element = body_wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, selector)))
                     try:
-                        WebDriverWait(self.driver, 2).until(
+                        WebDriverWait(self.driver, 1).until(
                             lambda d: body_element.text and len(body_element.text.strip()) > 50
                         )
-                        body_text = body_element.text if hasattr(body_element, 'text') else body_element.get_attribute('textContent') or ''
-                        print(f"  ✓ Template content loaded ({len(body_text)} chars)")
-                    except:
-                        print("  ⚠️  Warning: Template content may not have loaded fully")
+                    except Exception:
+                        pass
                     break
-                except:
+                except Exception:
                     continue
-            
-            print(f"✓ Template selected and loaded: '{template_name}'")
             
         except Exception as e:
             raise Exception(f"Failed to select template '{template_name}': {e}")
@@ -856,7 +1062,6 @@ class FreeScoutAutomation:
             Tuple of (subject, body) - subject may be empty if not found
         """
         try:
-            print("Extracting template content from body...")
             # Find the email body/editor - FreeScout uses contenteditable div
             body_selectors = [
                 "div.note-editable[contenteditable='true']",  # FreeScout specific
@@ -873,12 +1078,10 @@ class FreeScoutAutomation:
             body_element = None
             for selector in body_selectors:
                 try:
-                    print(f"  Trying body selector: {selector[:50]}...")
                     body_element = self.wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, selector)))
                     if body_element:
-                        print(f"  ✓ Found body editor with: {selector[:50]}")
                         break
-                except:
+                except Exception:
                     continue
             
             if not body_element:
@@ -897,17 +1100,6 @@ class FreeScoutAutomation:
                 # Also get text version for subject extraction
                 body_text = body_element.text if hasattr(body_element, 'text') else body_element.get_attribute('innerText') or body_element.get_attribute('textContent') or ""
             
-            print(f"  Raw template HTML length: {len(body_html)} chars")
-            print(f"  Raw template text length: {len(body_text)} chars")
-            # Debug: Check if placeholder exists in HTML
-            if "[Prospective Sponsor's Name]" in body_html or "[prospective sponsor's name]" in body_html.lower():
-                print(f"  ✓ Found '[Prospective Sponsor's Name]' in template HTML")
-                # Show snippet
-                idx = body_html.lower().find("[prospective sponsor's name]")
-                if idx >= 0:
-                    snippet = body_html[max(0, idx-30):idx+80]
-                    print(f"  Snippet: ...{snippet}...")
-            
             # Extract subject line from text version (line starting with "Subject -" or "Subject:")
             subject = ""
             body_lines = body_text.split('\n')
@@ -922,7 +1114,6 @@ class FreeScoutAutomation:
                         subject = line_stripped.split("Subject -", 1)[-1].split("subject -", 1)[-1].strip()
                     elif "Subject:" in line_stripped or "subject:" in line_stripped:
                         subject = line_stripped.split("Subject:", 1)[-1].split("subject:", 1)[-1].strip()
-                    print(f"  Found subject: '{subject}'")
                     subject_found = True
                     break
             
@@ -950,10 +1141,6 @@ class FreeScoutAutomation:
             body_html = re.sub(r'<p[^>]*>\s*</p>', '', body_html, flags=re.IGNORECASE)
             # Preserve ALL whitespace and newlines - only trim leading/trailing whitespace from entire string
             body_html = body_html.strip()
-            
-            print(f"  Extracted subject: '{subject}'")
-            print(f"  Body HTML length after cleanup: {len(body_html)} chars")
-            
             return subject, body_html  # Return HTML to preserve formatting
             
         except Exception as e:
@@ -973,11 +1160,26 @@ class FreeScoutAutomation:
         from config import PLACEHOLDER_MAPPINGS
         
         filled_body = body
-        contact_person = sponsor_data.get("contact_person", "")
+        contact_person = (sponsor_data.get("contact_person") or "").strip()
         company_name = sponsor_data.get("company_name", "")
-        
-        # Extract first name from contact person (everything before first space)
-        contact_first_name = contact_person.split()[0] if contact_person and contact_person.strip() else contact_person
+        email_str = sponsor_data.get("email", "")
+        if contact_person:
+            contact_first_name = (contact_person.split()[0] or "").strip().capitalize()
+        else:
+            full_from_email, contact_first_name = _name_from_email(
+                email_str.split(",")[0].strip() if email_str else ""
+            )
+            if full_from_email:
+                contact_person = full_from_email
+
+        # Collapse block-only placeholder so "Hello" and name stay on one line (no extra space below Hello)
+        for ph in ("{%customer.firstName%}", "{% customer.firstName %}"):
+            filled_body = re.sub(r'</p>\s*<p[^>]*>\s*' + re.escape(ph) + r'\s*</p>', ' ' + contact_first_name, filled_body, flags=re.IGNORECASE)
+            filled_body = re.sub(r'</div>\s*<div[^>]*>\s*' + re.escape(ph) + r'\s*</div>', ' ' + contact_first_name, filled_body, flags=re.IGNORECASE)
+        # FreeScout-style placeholder: {%customer.firstName%}
+        filled_body = filled_body.replace("{%customer.firstName%}", contact_first_name)
+        if "{% customer.firstName %}" in filled_body:
+            filled_body = filled_body.replace("{% customer.firstName %}", contact_first_name)
         
         # Get product name - priority: Company Name first, then General Info
         product_name = company_name  # Use Company Name first (always prefer this)
@@ -989,11 +1191,6 @@ class FreeScoutAutomation:
                 if general_info:
                     product_name = general_info
         
-        print(f"  Filling placeholders:")
-        print(f"    Contact Person (full): '{contact_person}'")
-        print(f"    Contact Person (first name): '{contact_first_name}'")
-        print(f"    Company Name: '{company_name}'")
-        
         # Check if placeholders exist in body (check both plain text and HTML)
         # The apostrophe might be HTML encoded as &#39; or &apos;
         placeholder_variations = [
@@ -1002,30 +1199,6 @@ class FreeScoutAutomation:
             "[Prospective Sponsor&apos;s Name]",  # HTML entity &apos;
             "[Prospective Sponsor&rsquo;s Name]",  # HTML entity &rsquo;
         ]
-        
-        placeholder_found = False
-        for variant in placeholder_variations:
-            if variant in filled_body:
-                print(f"    ✓ Found placeholder variant: '{variant}' in body")
-                placeholder_found = True
-                break
-        
-        # Also check case-insensitive
-        if not placeholder_found:
-            for variant in placeholder_variations:
-                if variant.lower() in filled_body.lower():
-                    print(f"    ✓ Found placeholder variant (case variation): '{variant}'")
-                    placeholder_found = True
-                    break
-        
-        # Check with regex for split across tags
-        if not placeholder_found:
-            if re.search(r'\[Prospective\s+Sponsor[&#\w;]*s\s+Name\]', filled_body, re.IGNORECASE):
-                print(f"    ✓ Found '[Prospective Sponsor's Name]' in body (regex match)")
-                placeholder_found = True
-        
-        if "[Company Name]" in filled_body:
-            print(f"    ✓ Found '[Company Name]' in body")
         
         # Fill placeholders in order (longest first to avoid partial replacements)
         # Handle both plain text and HTML (placeholders might be in HTML tags or as text)
@@ -1062,37 +1235,26 @@ class FreeScoutAutomation:
             # Handle [Prospective Sponsor's Name]
             placeholder_with_apos = f"[Prospective Sponsor{apostrophe_char}s Name]"
             if placeholder_with_apos in filled_body:
-                count = filled_body.count(placeholder_with_apos)
                 filled_body = filled_body.replace(placeholder_with_apos, contact_first_name)
-                print(f"    ✓ Replaced '{placeholder_with_apos}' ({count} occurrences) - Unicode apostrophe")
             
-            # Handle [Customer Company's product name]
             product_placeholder = f"[Customer Company{apostrophe_char}s product name]"
             if product_placeholder in filled_body:
-                count = filled_body.count(product_placeholder)
                 filled_body = filled_body.replace(product_placeholder, product_name)
-                print(f"    ✓ Replaced '{product_placeholder}' ({count} occurrences) - Unicode apostrophe")
         
         # Also try regex pattern for any apostrophe variation
         apostrophe_pattern = r'\[Prospective Sponsor[\'\"\u2018\u2019]s Name\]'
         if re.search(apostrophe_pattern, filled_body, re.IGNORECASE):
-            matches = re.findall(apostrophe_pattern, filled_body, re.IGNORECASE)
             filled_body = re.sub(apostrophe_pattern, contact_first_name, filled_body, flags=re.IGNORECASE)
-            print(f"    ✓ Replaced {len(matches)} occurrence(s) with Unicode apostrophe regex")
         
         # Also try regex pattern for [Customer Company's product name] with any apostrophe
         product_apostrophe_pattern = r'\[Customer Company[\'\"\u2018\u2019]s product name\]'
         if re.search(product_apostrophe_pattern, filled_body, re.IGNORECASE):
-            matches = re.findall(product_apostrophe_pattern, filled_body, re.IGNORECASE)
             filled_body = re.sub(product_apostrophe_pattern, product_name, filled_body, flags=re.IGNORECASE)
-            print(f"    ✓ Replaced {len(matches)} occurrence(s) of product name placeholder with Unicode apostrophe regex")
         
         for placeholder, replacement in placeholder_patterns:
             # Simple string replacement - replace ALL occurrences
-            count_before = filled_body.count(placeholder)
-            if count_before > 0:
+            if filled_body.count(placeholder) > 0:
                 filled_body = filled_body.replace(placeholder, replacement)
-                print(f"    ✓ Replaced '{placeholder}' ({count_before} occurrences) with '{replacement}'")
             
             # Also replace HTML entity encoded versions
             # Brackets encoded
@@ -1100,37 +1262,24 @@ class FreeScoutAutomation:
             count_html_brackets = filled_body.count(placeholder_html_brackets)
             if count_html_brackets > 0:
                 filled_body = filled_body.replace(placeholder_html_brackets, replacement)
-                print(f"    ✓ Replaced HTML brackets version ({count_html_brackets} occurrences)")
             
             # Apostrophe encoded as &#39;
             placeholder_html_39 = placeholder.replace("'", "&#39;")
             count_html_39 = filled_body.count(placeholder_html_39)
             if count_html_39 > 0:
                 filled_body = filled_body.replace(placeholder_html_39, replacement)
-                print(f"    ✓ Replaced HTML &#39; version ({count_html_39} occurrences)")
             
             # Apostrophe encoded as &apos;
             placeholder_html_apos = placeholder.replace("'", "&apos;")
             count_html_apos = filled_body.count(placeholder_html_apos)
             if count_html_apos > 0:
                 filled_body = filled_body.replace(placeholder_html_apos, replacement)
-                print(f"    ✓ Replaced HTML &apos; version ({count_html_apos} occurrences)")
             
             # Both brackets and apostrophe encoded
             placeholder_html_full = placeholder.replace("[", "&#91;").replace("]", "&#93;").replace("'", "&#39;")
             count_html_full = filled_body.count(placeholder_html_full)
             if count_html_full > 0:
                 filled_body = filled_body.replace(placeholder_html_full, replacement)
-                print(f"    ✓ Replaced fully encoded version ({count_html_full} occurrences)")
-            
-            # Verify replacement worked
-            count_after = filled_body.count(placeholder)
-            if count_after > 0:
-                print(f"      ⚠️  Warning: {count_after} occurrences of '{placeholder}' still remain!")
-                idx = filled_body.find(placeholder)
-                if idx >= 0:
-                    snippet = filled_body[max(0, idx-50):idx+len(placeholder)+50]
-                    print(f"      Snippet: ...{snippet}...")
         
         # Look for any other [placeholder] patterns and try to match from row_data
         placeholder_pattern = r'\[([^\]]+)\]'
@@ -1143,7 +1292,6 @@ class FreeScoutAutomation:
                 row_data = sponsor_data.get("row_data", {})
                 if placeholder in row_data:
                     filled_body = filled_body.replace(f"[{placeholder}]", str(row_data[placeholder]))
-                    print(f"    ✓ Replaced '[{placeholder}]' from row_data")
         
         # Final aggressive pass for [Prospective Sponsor's Name] - use while loop to replace ALL
         # This ensures we catch every occurrence
@@ -1164,12 +1312,8 @@ class FreeScoutAutomation:
         ]
         
         for placeholder_var in placeholder_final_variations:
-            count = 0
             while placeholder_var in filled_body:
                 filled_body = filled_body.replace(placeholder_var, contact_first_name)
-                count += 1
-            if count > 0:
-                print(f"    ✓ Final pass: Replaced '{placeholder_var}' ({count} occurrences) with '{contact_first_name}'")
         
         # Also try regex for any remaining variations (spaces, different encoding, any apostrophe)
         # Match any apostrophe character: ' ' ' or HTML entities
@@ -1177,32 +1321,15 @@ class FreeScoutAutomation:
         matches = re.findall(pattern, filled_body, re.IGNORECASE)
         if matches:
             filled_body = re.sub(pattern, contact_first_name, filled_body, flags=re.IGNORECASE)
-            print(f"    ✓ Final pass: Replaced {len(matches)} occurrence(s) with regex pattern (any apostrophe)")
         
-        # Final verification - check for any variation
-        still_found = False
-        for placeholder_var in placeholder_final_variations:
-            if placeholder_var in filled_body:
-                still_found = True
-                idx = filled_body.find(placeholder_var)
-                if idx >= 0:
-                    snippet = filled_body[max(0, idx-100):idx+150]
-                    print(f"    ⚠️  Warning: '{placeholder_var}' still found after all replacements!")
-                    print(f"    Location snippet: ...{snippet}...")
-        
-        # Check for any variation with "[Prospective Sponsor"
         if "[Prospective Sponsor" in filled_body:
             idx = filled_body.find("[Prospective Sponsor")
             if idx >= 0:
                 end_idx = filled_body.find("]", idx)
                 if end_idx > idx:
                     remaining = filled_body[idx:end_idx+1]
-                    # Check if it's one we already tried
                     if remaining not in placeholder_final_variations:
-                        print(f"    ⚠️  Warning: Found variation '{remaining}' that wasn't in our list!")
-                        # Try to replace it anyway
                         filled_body = filled_body.replace(remaining, contact_first_name)
-                        print(f"    ✓ Attempted to replace variation: '{remaining}'")
         
         # Minimal cleanup: remove only truly empty elements, preserve ALL formatting including line breaks
         # IMPORTANT: Don't remove <div><br></div> or <span><br></span> - these create line breaks!
@@ -1210,46 +1337,33 @@ class FreeScoutAutomation:
         filled_body = re.sub(r'<div[^>]*>\s*<span[^>]*>\s*</span>\s*</div>', '', filled_body, flags=re.IGNORECASE)
         # Remove completely empty divs (no content, no <br>, no spans) - but preserve <div><br></div>
         filled_body = re.sub(r'<div[^>]*>\s*</div>', '', filled_body, flags=re.IGNORECASE)
-        # DON'T remove trailing <br> tags - they might be intentional line breaks
-        # DON'T reduce <br> tags - preserve the structure as-is
-        # Remove only completely empty paragraphs (no content, no <br>)
+        # Remove empty paragraphs and paragraphs that only contain a single <br> (extra blank line below Hello)
         filled_body = re.sub(r'<p[^>]*>\s*</p>', '', filled_body, flags=re.IGNORECASE)
+        filled_body = re.sub(r'<p[^>]*>\s*<br\s*/?>\s*</p>', '', filled_body, flags=re.IGNORECASE)
         # Preserve ALL whitespace and line breaks - only trim trailing whitespace from entire string
         filled_body = filled_body.rstrip()
-        
-        # Validate HTML structure is preserved after replacement
-        # Check for common HTML tags that should be preserved
-        html_tags_present = bool(re.search(r'<(a|strong|em|b|i|span|p|div|h[1-6]|ul|ol|li)', filled_body, re.IGNORECASE))
-        if html_tags_present:
-            print(f"    ✓ HTML structure preserved (tags found)")
-        else:
-            print(f"    ⚠️  Warning: No HTML tags found - content may be plain text")
-        
-        # Check for hyperlinks specifically
-        links_present = bool(re.search(r'<a\s+[^>]*href', filled_body, re.IGNORECASE))
-        if links_present:
-            link_count = len(re.findall(r'<a\s+[^>]*href', filled_body, re.IGNORECASE))
-            print(f"    ✓ Hyperlinks preserved ({link_count} link(s) found)")
-        else:
-            # Check if original had links
-            if '<a' in body.lower():
-                print(f"    ⚠️  Warning: Original had links but they may be lost after replacement")
         
         return filled_body
     
     def fill_email_body(self, body: str, sponsor_data: Dict = None):
         """Fill the email body with content"""
         try:
-            print("Filling email body...")
-            
             # Get replacement values if sponsor_data is provided
             contact_first_name = ""
             company_name = ""
             contact_person = ""
             product_name = ""
             if sponsor_data:
-                contact_person = sponsor_data.get("contact_person", "")
-                contact_first_name = contact_person.split()[0] if contact_person and contact_person.strip() else contact_person
+                contact_person = (sponsor_data.get("contact_person") or "").strip()
+                email_str = sponsor_data.get("email", "")
+                if contact_person:
+                    contact_first_name = (contact_person.split()[0] or "").strip().capitalize()
+                else:
+                    full_from_email, contact_first_name = _name_from_email(
+                        email_str.split(",")[0].strip() if email_str else ""
+                    )
+                    if full_from_email:
+                        contact_person = full_from_email
                 company_name = sponsor_data.get("company_name", "")
                 # Get product name - priority: Company Name first, then General Info
                 product_name = company_name  # Use Company Name first (always prefer this)
@@ -1276,18 +1390,15 @@ class FreeScoutAutomation:
             body_element = None
             for selector in body_selectors:
                 try:
-                    print(f"  Trying body selector: {selector[:50]}...")
                     body_element = self.wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, selector)))
                     if body_element:
-                        print(f"  ✓ Found body editor with: {selector[:50]}")
                         break
-                except:
+                except Exception:
                     continue
             
             if not body_element:
                 raise Exception("Could not find email body editor.")
             
-            # Clear existing content and fill
             if body_element.tag_name == 'iframe':
                 self.driver.switch_to.frame(body_element)
                 editor_body = self.driver.find_element(By.TAG_NAME, "body")
@@ -1299,9 +1410,6 @@ class FreeScoutAutomation:
                 body_element.send_keys(body)
             else:
                 # Contenteditable div - use innerHTML to preserve formatting and links
-                print("  Setting HTML content to preserve formatting...")
-                
-                # Use JavaScript to set innerHTML and replace placeholders in one go
                 try:
                     # Combined script to clear, set HTML, and replace placeholders
                     # The placeholder is inside HTML tags, so we need to replace it in the HTML string
@@ -1369,7 +1477,7 @@ class FreeScoutAutomation:
                         }
                         // Also try regex pattern for any apostrophe variation (straight quote, curly quotes)
                         // Handle U+0027 (straight), U+2019 (right curly), U+2018 (left curly)
-                        html = html.replace(/\[Customer Company[''\u2018\u2019]s product name\]/g, productName);
+                        html = html.replace(/\\[Customer Company[''\\u2018\\u2019]s product name\\]/g, productName);
                         
                         // Replace [Customer Company POC] with full contact person name
                         while (html.indexOf('[Customer Company POC]') !== -1) {
@@ -1475,10 +1583,9 @@ class FreeScoutAutomation:
                     """
                     result = self.driver.execute_script(set_and_replace_script, body_element, body, contact_first_name, company_name, contact_person, product_name)
                     # DOM should update immediately, minimal wait if needed
-                    time.sleep(0.1)
+                    _delay(0.1)
                     
                     # Update hidden textarea to ensure form submission uses correct content
-                    print("  Updating hidden textarea...")
                     self.driver.execute_script("""
                         var element = arguments[0];
                         var container = element.closest('.note-editor');
@@ -1491,51 +1598,26 @@ class FreeScoutAutomation:
                             }
                         }
                     """, body_element)
-                    print("  ✓ Hidden textarea updated")
                     
                     # Handle result and log debug info
                     if isinstance(result, dict):
                         replacement_success = result.get('replacementSuccess', False)
-                        method_used = result.get('methodUsed', 'unknown')
-                        is_empty = result.get('isEmpty', False)
-                        html_length = result.get('htmlLength', 0)
-                        
-                        # Debug logging
-                        print(f"  Method used: {method_used}")
-                        print(f"  HTML length: {html_length}")
-                        if is_empty:
-                            print("  ⚠️  Warning: Content appears to be empty!")
-                        else:
-                            print("  ✓ Content is not empty")
-                        
-                        if replacement_success:
-                            print("  ✓ Placeholders replaced successfully")
-                        else:
-                            print("  ⚠️  Warning: Placeholder might still be in DOM")
                     else:
-                        # Backward compatibility
                         replacement_success = result if isinstance(result, bool) else False
-                        print("  ⚠️  Unexpected result format")
-                except Exception as e:
-                    print(f"  Warning: Could not set HTML directly: {e}")
-                    import traceback
-                    traceback.print_exc()
+                except Exception:
                     # Fallback: Clear and use send_keys
-                    print("  Falling back to text input...")
                     body_element.click()
-                    time.sleep(0.2)
+                    _delay(0.2)
                     body_element.send_keys(Keys.CONTROL + "a")
-                    time.sleep(0.2)
+                    _delay(0.2)
                     body_element.send_keys(Keys.DELETE)
-                    time.sleep(0.3)
+                    _delay(0.3)
                     # Convert HTML to text for fallback
                     # Simple HTML to text conversion
                     text_body = re.sub(r'<[^>]+>', '', body)  # Remove HTML tags
                     text_body = html.unescape(text_body)  # Decode HTML entities
                     body_element.send_keys(text_body)
-                    time.sleep(0.5)
-            
-            print("✓ Email body filled")
+                    _delay(0.5)
             
         except Exception as e:
             raise Exception(f"Failed to fill email body: {e}")
@@ -1543,7 +1625,6 @@ class FreeScoutAutomation:
     def fill_subject_field(self, subject: str):
         """Fill the subject field"""
         try:
-            print("Looking for subject field...")
             # FreeScout uses id="subject"
             subject_selectors = [
                 "#subject",  # FreeScout specific
@@ -1558,23 +1639,17 @@ class FreeScoutAutomation:
             subject_field = None
             for selector in subject_selectors:
                 try:
-                    print(f"  Trying subject selector: {selector[:50]}...")
                     subject_field = self.wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, selector)))
                     if subject_field:
-                        print(f"  ✓ Found subject field with: {selector[:50]}")
                         break
-                except Exception as e:
-                    print(f"  ✗ Not found: {str(e)[:50]}")
+                except Exception:
                     continue
             
             if not subject_field:
                 raise Exception("Could not find subject field.")
             
-            print(f"Filling subject field: {subject[:50]}...")
             subject_field.clear()
             subject_field.send_keys(subject)
-            # No need to wait - field is filled immediately
-            print("✓ Subject field filled")
             
         except Exception as e:
             raise Exception(f"Failed to fill subject field: {e}")
@@ -1645,13 +1720,11 @@ class FreeScoutAutomation:
                         
                         # Debug: Check if placeholder is in the preview
                         if "[Prospective Sponsor" in text_content:
-                            print(f"  ⚠️  DEBUG: Placeholder still found in preview text!")
                             # Get HTML to see what's actually there
                             html_content = body_element.get_attribute('innerHTML') or ''
                             if "[Prospective Sponsor" in html_content:
                                 idx = html_content.find("[Prospective Sponsor")
                                 snippet = html_content[max(0, idx-50):idx+80]
-                                print(f"  DEBUG: HTML snippet: ...{snippet}...")
                     break
                 except:
                     continue
@@ -1659,14 +1732,12 @@ class FreeScoutAutomation:
             return preview
             
         except Exception as e:
-            print(f"Warning: Could not get full email preview: {e}")
             return {}
     
     def send_email(self):
         """Click the Send button"""
         try:
             # Before sending, ensure hidden textarea is synchronized
-            print("Preparing to send email...")
             body_selectors = [
                 "div.note-editable[contenteditable='true']",
                 "div[contenteditable='true']",
@@ -1694,7 +1765,6 @@ class FreeScoutAutomation:
                                 textarea.dispatchEvent(event);
                             }
                         """, editor_container, current_html)
-                        print("  ✓ Hidden textarea synchronized")
                     
                     break
                 except:
@@ -1720,7 +1790,6 @@ class FreeScoutAutomation:
                     else:
                         send_button = self.wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, selector)))
                     if send_button:
-                        print(f"  ✓ Found Send button with selector: {selector}")
                         break
                 except:
                     continue
@@ -1729,7 +1798,6 @@ class FreeScoutAutomation:
                 raise Exception("Could not find Send button.")
             
             # Send the email
-            print("  Clicking Send button...")
             send_button.click()
             print("✓ Email sent successfully")
             
@@ -1747,118 +1815,129 @@ class FreeScoutAutomation:
         Returns:
             True if email was sent successfully, False otherwise
         """
+        search_tab_handles = None
+        template_name = sponsor_data.get('template_name', 'Unknown')
+        valid_emails = self._parse_emails(sponsor_data.get('email', 'N/A'))
+        emails_display = ', '.join(valid_emails) if valid_emails else sponsor_data.get('email', 'N/A')
+        use_reply_flow = (
+            REPLY_TO_THREAD_TEMPLATE_PATTERN
+            and REPLY_TO_THREAD_TEMPLATE_PATTERN.lower() in template_name.lower()
+        )
+        if len(valid_emails) > 1:
+            search_tab_handles = self._open_search_tabs_for_emails(valid_emails)
         try:
-            template_name = sponsor_data.get('template_name', 'Unknown')
-            # Parse and display all emails
-            email_str = sponsor_data.get('email', 'N/A')
-            if email_str != 'N/A' and (',' in email_str or ';' in email_str):
-                if ',' in email_str:
-                    emails = [e.strip() for e in email_str.split(',')]
-                else:
-                    emails = [e.strip() for e in email_str.split(';')]
-                emails = [e for e in emails if e and '@' in e]
-                emails_display = ', '.join(emails) if emails else email_str
-            else:
-                emails_display = email_str
-            
-            print(f"\n📧 Processing email for: {emails_display}")
-            print(f"📋 Template: {template_name}")
-            
-            # Step 1: Click new conversation
+            print(f"\n📧 {emails_display} — {template_name}")
+            if use_reply_flow:
+                if not valid_emails:
+                    print("No email to search for; skipping.")
+                    return False
+                any_sent = False
+                main_handle = self.driver.current_window_handle
+                for i, email in enumerate(valid_emails):
+                    print(f"\n  → Thread for {email}")
+                    # When we pre-opened search tabs (multiple emails), use that tab so we don't navigate main window to search
+                    if search_tab_handles is not None and i < len(search_tab_handles):
+                        if search_tab_handles[i] not in self.driver.window_handles:
+                            print(f"  Search tab for {email} no longer available; skipping.")
+                            continue
+                        self.driver.switch_to.window(search_tab_handles[i])
+                        _delay(0.3)
+                        # Ensure this tab shows this email's search (tab may still be loading or show mailbox)
+                        if FREESCOUT_URL:
+                            base = FREESCOUT_URL.rstrip("/")
+                            want_url = f"{base}/search?q={urllib.parse.quote(email, safe='')}"
+                            try:
+                                current = self.driver.current_url or ""
+                                encoded_q = urllib.parse.quote(email, safe="")
+                                if "search" not in current or encoded_q not in current:
+                                    self.driver.get(want_url)
+                                    _delay(1)
+                            except Exception:
+                                pass
+                        thread_opened = self.open_thread_for_email(email, already_on_search_page=True)
+                    else:
+                        thread_opened = self.open_thread_for_email(email)
+                    if not thread_opened:
+                        print(f"  No thread found for {email}; skipping.")
+                        continue
+                    self.open_reply_form()
+                    try:
+                        self.select_template(template_name)
+                        subject, body = self.extract_template_content()
+                        body_selectors = [
+                            "div.note-editable[contenteditable='true']",
+                            "div[contenteditable='true']",
+                            ".note-editable",
+                        ]
+                        for selector in body_selectors:
+                            try:
+                                body_el = self.driver.find_element(By.CSS_SELECTOR, selector)
+                                self.driver.execute_script(
+                                    "arguments[0].innerHTML = ''; arguments[0].textContent = '';", body_el
+                                )
+                                break
+                            except Exception:
+                                continue
+                        filled_body = self.fill_placeholders(body, sponsor_data)
+                        self.focus_reply_editor_and_fill(filled_body)
+                    except Exception as e:
+                        print(f"  Reply form / template failed for {email}: {e}")
+                        continue
+                    if confirm_before_send:
+                        print("\n" + "="*80)
+                        print(f"REPLY PREVIEW (thread: {email}):")
+                        print("="*80)
+                        print(f"Body:\n{filled_body[:500]}")
+                        if len(filled_body) > 500:
+                            print("... (truncated)")
+                        print("="*80)
+                        confirmation = input("\nSend this reply? (y/n/skip): ").strip().lower()
+                        if confirmation == "n":
+                            print("Reply cancelled by user.")
+                            break
+                        if confirmation == "skip":
+                            print("Skipping this reply.")
+                            continue
+                    self.click_send_reply()
+                    print(f"  ✓ Reply sent to thread: {email}")
+                    any_sent = True
+                    conv_handle = self.driver.current_window_handle
+                    if conv_handle != main_handle and main_handle in self.driver.window_handles:
+                        self.driver.switch_to.window(main_handle)
+                    if conv_handle in self.driver.window_handles and conv_handle != main_handle:
+                        self.driver.switch_to.window(conv_handle)
+                        self.driver.close()
+                    if main_handle in self.driver.window_handles:
+                        self.driver.switch_to.window(main_handle)
+                print(f"  Template used: {template_name}")
+                return any_sent
+            # New conversation flow
             self.click_new_conversation()
-            
-            # Step 2: Fill To field
-            self.fill_to_field(sponsor_data['email'])
-            
-            # Step 3: Select template
+            self.fill_to_field(sponsor_data["email"])
             self.select_template(template_name)
-            
-            # Step 4: Extract template content
-            # IMPORTANT: Don't clear before extracting - we need the template content first
             subject, body = self.extract_template_content()
-            
-            # IMPORTANT: Clear the editor NOW after extraction, before we set the replaced content
-            # This prevents duplicate content - the template is still in the editor after extraction
-            print("  Clearing editor after extraction to prevent duplicates...")
             body_selectors = [
                 "div.note-editable[contenteditable='true']",
                 "div[contenteditable='true']",
-                ".note-editable"
+                ".note-editable",
             ]
             for selector in body_selectors:
                 try:
                     body_element = self.driver.find_element(By.CSS_SELECTOR, selector)
-                    # Clear completely - this removes the original template content
-                    self.driver.execute_script("arguments[0].innerHTML = ''; arguments[0].textContent = '';", body_element)
-                    # Clear happens immediately, no need to wait
-                    print("  ✓ Editor cleared")
+                    self.driver.execute_script(
+                        "arguments[0].innerHTML = ''; arguments[0].textContent = '';", body_element
+                    )
                     break
-                except:
+                except Exception:
                     continue
-            
-            # Debug: Check what we extracted
-            print(f"\n  DEBUG: Checking extracted body for placeholders...")
-            if "[Prospective Sponsor's Name]" in body:
-                print(f"    ✓ Found '[Prospective Sponsor's Name]' in extracted body")
-            elif "[Prospective Sponsor" in body:
-                print(f"    ⚠️  Found partial match '[Prospective Sponsor' - might be split or encoded")
-                # Show snippet
-                idx = body.find("[Prospective Sponsor")
-                if idx >= 0:
-                    snippet = body[max(0, idx-20):idx+80]
-                    print(f"    Snippet: ...{snippet}...")
-            
-            # Step 5: Fill placeholders
             filled_body = self.fill_placeholders(body, sponsor_data)
-            
-            # Debug: Verify after replacement
-            print(f"\n  DEBUG: Checking filled body after replacement...")
-            # Check for exact match
-            if "[Prospective Sponsor's Name]" in filled_body:
-                count_remaining = filled_body.count("[Prospective Sponsor's Name]")
-                print(f"    ⚠️  '[Prospective Sponsor's Name]' still found ({count_remaining} times) after Python replacement!")
-                idx = filled_body.find("[Prospective Sponsor's Name]")
-                if idx >= 0:
-                    snippet = filled_body[max(0, idx-50):idx+80]
-                    print(f"    Snippet: ...{snippet}...")
-                    # Show the actual characters around it to check for encoding issues
-                    print(f"    Character codes around placeholder:")
-                    for i in range(max(0, idx-5), min(len(filled_body), idx+len("[Prospective Sponsor's Name]")+5)):
-                        char = filled_body[i]
-                        print(f"      [{i}]: '{char}' (ord: {ord(char)})")
-            else:
-                print(f"    ✓ '[Prospective Sponsor's Name]' successfully replaced in Python string")
-            
-            # Also check for any variation
-            if "[Prospective Sponsor" in filled_body:
-                idx = filled_body.find("[Prospective Sponsor")
-                if idx >= 0:
-                    end_idx = filled_body.find("]", idx)
-                    if end_idx > idx:
-                        variation = filled_body[idx:end_idx+1]
-                        print(f"    ⚠️  Found variation: '{variation}' - checking character codes...")
-                        for char in variation:
-                            print(f"      '{char}' (ord: {ord(char)})")
-            
-            # Step 6: Remove subject line from body (already done in extract_template_content)
-            # Step 7: Fill email body (pass sponsor_data for placeholder replacement)
             self.fill_email_body(filled_body, sponsor_data)
-            
-            # Step 8: Fill subject field
             if subject:
                 self.fill_subject_field(subject)
-            
-            # Step 9: Show preview and get confirmation
             if confirm_before_send:
                 preview = self.get_email_preview()
-                # Parse multiple emails for display
-                email_str = sponsor_data['email']
-                if ',' in email_str or ';' in email_str:
-                    emails = [e.strip() for e in re.split(r'[,;]', email_str) if e.strip()]
-                    to_display = ', '.join(emails)
-                else:
-                    to_display = email_str
-                
+                parsed = self._parse_emails(sponsor_data.get("email", ""))
+                to_display = ", ".join(parsed) if parsed else sponsor_data.get("email", "")
                 print("\n" + "="*80)
                 print("EMAIL PREVIEW:")
                 print("="*80)
@@ -1868,39 +1947,26 @@ class FreeScoutAutomation:
                 if len(filled_body) > 500:
                     print("... (truncated)")
                 print("="*80)
-                
                 confirmation = input("\nSend this email? (y/n/skip): ").strip().lower()
-                if confirmation == 'n':
+                if confirmation == "n":
                     print("Email cancelled by user.")
                     return False
-                elif confirmation == 'skip':
+                if confirmation == "skip":
                     print("Skipping this email.")
                     return False
-                # 'y' or any other input will proceed
-            
-            # Step 10: Send email
             self.send_email()
-            # Show all emails in success message
-            email_str = sponsor_data['email']
-            if ',' in email_str or ';' in email_str:
-                emails = [e.strip() for e in re.split(r'[,;]', email_str) if e.strip() and '@' in e]
-                email_display = ', '.join(emails) if emails else email_str
-            else:
-                email_display = email_str
+            email_display = ", ".join(valid_emails) if valid_emails else sponsor_data.get("email", "")
             print(f"✓ Email sent successfully to: {email_display}")
             print(f"  Template used: {template_name}")
             return True
             
         except Exception as e:
-            # Show all emails in error message
-            email_str = sponsor_data['email']
-            if ',' in email_str or ';' in email_str:
-                emails = [e.strip() for e in re.split(r'[,;]', email_str) if e.strip() and '@' in e]
-                email_display = ', '.join(emails) if emails else email_str
-            else:
-                email_display = email_str
+            email_display = ", ".join(self._parse_emails(sponsor_data.get("email", ""))) or sponsor_data.get("email", "")
             print(f"✗ Error sending email to {email_display}: {e}")
             return False
+        finally:
+            if search_tab_handles is not None:
+                self._close_search_tabs(search_tab_handles)
     
     def close(self):
         """Close the browser"""
