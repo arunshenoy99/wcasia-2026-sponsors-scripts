@@ -1,10 +1,25 @@
 #!/usr/bin/env python3
-"""Compare original and generated documents"""
+"""Compare the 2025 reference document with the generated 2026 template (see README.md)."""
+
+import os
+import sys
 
 from docx import Document
+from reference_doc import find_reference_doc
+
+GENERATED_TEMPLATE = "WordCamp Asia 2026 Super Admin Sponsorship Agreement Template.docx"
+
+reference_path = find_reference_doc()
+if reference_path is None:
+    sys.exit("No 2025 reference agreement (.docx) found in this folder — see README.md.")
+if not os.path.exists(GENERATED_TEMPLATE):
+    sys.exit(
+        f"Generated template '{GENERATED_TEMPLATE}' not found. "
+        "Run generate_templates.py first."
+    )
 
 print("=== ORIGINAL 2025 DOCUMENT ===\n")
-doc_orig = Document("1-Elementor WordCamp Asia 2025 Super Admin Sponsorship Agreement.docx")
+doc_orig = Document(str(reference_path))
 
 for i, para in enumerate(doc_orig.paragraphs[6:30]):
     style_name = para.style.name if para.style else "None"
@@ -37,7 +52,7 @@ for i, para in enumerate(doc_orig.paragraphs[6:30]):
     print()
 
 print("\n=== GENERATED 2026 DOCUMENT ===\n")
-doc_new = Document("WordCamp Asia 2026 Super Admin Sponsorship Agreement Template.docx")
+doc_new = Document(GENERATED_TEMPLATE)
 
 for i, para in enumerate(doc_new.paragraphs[6:30]):
     style_name = para.style.name if para.style else "None"

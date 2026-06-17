@@ -6,11 +6,14 @@ This repository contains tools and scripts for managing sponsor agreements and o
 
 ```
 Sponsors/
-├── Agreements/          # Sponsor agreement template generation
+├── Agreements/          # Sponsor agreement template generation (see Agreements/README.md)
 │   ├── generate_templates.py    # Main script to generate Word document templates
 │   ├── check_numbering.py       # Utility to check document numbering
 │   ├── compare_docs.py          # Utility to compare documents
-│   └── inspect_doc.py           # Utility to inspect document structure
+│   ├── inspect_doc.py           # Utility to inspect document structure
+│   ├── reference_doc.py         # Locates the 2025 reference .docx (imported helper)
+│   ├── requirements.txt         # python-docx
+│   └── README.md                # Reference-doc requirement, per-script details
 │
 ├── Admin/               # Camptix coupon usage helper (see Admin/README.md)
 │   ├── coupon_usage_report.py   # Build sponsor coupon vs summary counts
@@ -27,6 +30,7 @@ Sponsors/
 │   ├── config.py                # Shared settings (imported by scripts above)
 │   ├── requirements.txt
 │   ├── .env.example
+│   ├── published_sponsors.example.txt  # Copy to published_sponsors.txt (git-ignored)
 │   ├── .python-version          # Optional pyenv pin
 │   └── README.md                # Scripts reference, inputs/outputs, data flow
 │
@@ -45,15 +49,21 @@ The Agreements module generates Word document templates for different sponsor ti
 cd Agreements
 python3 -m venv venv
 source venv/bin/activate  # On Windows: venv\Scripts\activate
-pip install python-docx
+pip install -r requirements.txt
 ```
+
+**Reference document:** the scripts need a signed **2025 Super Admin sponsorship agreement** as a
+formatting source (**not committed** because `*.docx` is git-ignored). Place your copy in
+`Agreements/` — named `2025-super-admin-sponsorship-agreement.docx`, or any
+`*Super Admin*Sponsorship Agreement*.docx` file — before running. See **`Agreements/README.md`**
+for details and the inspection utilities.
 
 **Usage:**
 ```bash
 python generate_templates.py
 ```
 
-This generates Word document templates for all sponsor tiers (Super Admin, Admin, Editor, Author, Contributor, Subscriber, Viewer) and Addon agreements.
+This generates Word document templates for all sponsor tiers (Super Admin, Admin, Editor, Author, Contributor, Subscriber, Viewer) and Addon agreements in the current directory.
 
 ### Reachout Module
 

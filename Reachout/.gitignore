@@ -1,6 +1,9 @@
 # Environment variables
 .env
 
+# Local sponsor list for build_approval_company_email_csv.py (keep real names off git)
+published_sponsors.txt
+
 # Python
 __pycache__/
 *.py[cod]

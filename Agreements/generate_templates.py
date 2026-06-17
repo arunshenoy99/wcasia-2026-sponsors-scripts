@@ -9,6 +9,7 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 from docx.enum.style import WD_STYLE_TYPE
+from reference_doc import find_reference_doc
 
 def number_to_words(n):
     """Convert number to words for amounts"""
@@ -104,7 +105,13 @@ def create_template(tier_name, tier_data):
     
     # Copy numbering definitions from original document to get the exact format
     try:
-        orig_doc = Document("1-Elementor WordCamp Asia 2025 Super Admin Sponsorship Agreement.docx")
+        reference_path = find_reference_doc()
+        if reference_path is None:
+            raise FileNotFoundError(
+                "No 2025 reference agreement (.docx) found in this folder. "
+                "Add the signed 2025 Super Admin agreement here — see README.md."
+            )
+        orig_doc = Document(str(reference_path))
         if orig_doc.part.numbering_part and doc.part.numbering_part:
             # Get the XML from original
             orig_numbering = orig_doc.part.numbering_part.element
@@ -488,7 +495,13 @@ def create_addon_template():
     
     # Copy numbering definitions from original document
     try:
-        orig_doc = Document("1-Elementor WordCamp Asia 2025 Super Admin Sponsorship Agreement.docx")
+        reference_path = find_reference_doc()
+        if reference_path is None:
+            raise FileNotFoundError(
+                "No 2025 reference agreement (.docx) found in this folder. "
+                "Add the signed 2025 Super Admin agreement here — see README.md."
+            )
+        orig_doc = Document(str(reference_path))
         if orig_doc.part.numbering_part and doc.part.numbering_part:
             orig_numbering = orig_doc.part.numbering_part.element
             new_numbering = doc.part.numbering_part.element

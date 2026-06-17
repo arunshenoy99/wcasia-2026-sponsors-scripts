@@ -113,6 +113,14 @@ Or run without arguments to be prompted for the file path:
 python main.py
 ```
 
+**Resuming after a crash (`--start-from N`):** sponsors are processed in order, 1-based. If the
+browser session dies mid-run, `main.py` prints the exact command to resume. You can also pass it
+yourself to skip the first `N-1` sponsors:
+
+```bash
+python main.py round_leads.csv --start-from 42   # start at the 42nd sponsor
+```
+
 ### Round workflow (status-based leads)
 
 1. **Extract** from the **master** file (`.xlsx` / `.xls` / `.csv`). The master must include:
@@ -125,7 +133,11 @@ python main.py
    # Optional: single status, or date filter on Last Contact Date
    python extract_round_leads.py "path/to/master.xlsx" -s "First Email Sent" -o round_first.csv
    python extract_round_leads.py "path/to/master.xlsx" --before-date 2026-02-01 -o round_stale.csv
+   # --before-date filters on "Last Contact Date" by default; use --date-column to filter on another column
+   python extract_round_leads.py "path/to/master.xlsx" --before-date 2026-02-01 --date-column "Last Contact Date" -o round_stale.csv
    ```
+
+   Rows whose date cell is empty or unparseable are **included** by the `--before-date` filter (treated as never contacted).
 
 2. **Send** with `main.py` using the round CSV as the only argument (round file includes **Template Name**):
 
@@ -140,13 +152,27 @@ Configure **`STATUS_TO_TEMPLATE`**, **`EMAIL_COLUMN_PRIORITY`**, and related key
 
 **Standalone** script (does not call `main.py` or FreeScout).  
 **Input (`-i`):** your CSV export from an internal approval list. Column names are detected flexibly (e.g. company/sponsor name + contact/email columns).  
-**Output (`-o`):** CSV with `Company Name`, `Email`, and `Listed on WCAsia 2026 site` (matched against the public sponsors list hardcoded in the script — update `PUBLISHED_SPONSORS` when the public page changes).
+**Output (`-o`):** CSV with `Company Name`, `Email`, and `Listed on public sponsors site`.
+
+The "Listed on public sponsors site" flag is computed by matching each company against a local
+**published-sponsors list**. That list is **not** hardcoded — it is read from a text file
+(default: `published_sponsors.txt` next to the script; **git-ignored** so real names stay local).
+Create it once from the template:
+
+```bash
+cp published_sponsors.example.txt published_sponsors.txt
+# Edit published_sponsors.txt: one published sponsor name per line (see the file's header for rules)
+```
+
+Then run:
 
 ```bash
 python build_approval_company_email_csv.py -i path/to/approval_export.csv -o path/to/out.csv
+# Optional: point at a different list with -p / --published-sponsors path/to/list.txt
 ```
 
-Do not commit input/output CSVs if they contain contact data.
+If no list file is found, the script still runs but flags every row `No` and prints a warning.
+Do not commit input/output CSVs (or `published_sponsors.txt`) if they contain private data.
 
 ### FreeScout selector debugging (optional)
 
@@ -275,8 +301,8 @@ You can also point **`main.py`** directly at a standard spreadsheet (workflow A 
 
 | Script | Purpose | Typical inputs | Typical outputs |
 |--------|---------|----------------|-----------------|
-| **`main.py`** | Orchestrates send flow | Path to `.xlsx` / `.csv` (workflows A/B in **§5** above) | `logs/sent_emails_*.log`, emails in FreeScout |
-| **`extract_round_leads.py`** | Build round CSV from master | Master workbook path; optional `-o`, `-s`, `--before-date` | `round_YYYYMMDD.csv` or path from `-o` |
+| **`main.py`** | Orchestrates send flow | Path to `.xlsx` / `.csv` (workflows A/B in **§5** above); optional `--start-from N` to resume | `logs/sent_emails_*.log`, emails in FreeScout |
+| **`extract_round_leads.py`** | Build round CSV from master | Master workbook path; optional `-o`, `-s`, `--before-date`, `--date-column` | `round_YYYYMMDD.csv` or path from `-o` |
 | **`build_approval_company_email_csv.py`** | Company + email + public-site flag | `-i` approval CSV, `-o` output CSV | Written CSV only |
 | **`explore_freescout_selectors.py`** | Debug UI selectors | Optional search email; `.env` required | Console / browser inspection |
 
@@ -295,6 +321,7 @@ You can also point **`main.py`** directly at a standard spreadsheet (workflow A 
 |------|------|
 | **`requirements.txt`** | `pip install -r` dependencies |
 | **`.env.example`** | Copy to `.env`; documents optional vars |
+| **`published_sponsors.example.txt`** | Copy to `published_sponsors.txt` (git-ignored) for `build_approval_company_email_csv.py` |
 | **`.python-version`** | Optional pyenv pin |
 | **`README.md`** | This documentation |
 
@@ -312,6 +339,8 @@ Reachout/
 ├── .python-version
 ├── .env.example
 ├── .env                 # local only
+├── published_sponsors.example.txt
+├── published_sponsors.txt   # local only (git-ignored)
 └── README.md
 ```
 

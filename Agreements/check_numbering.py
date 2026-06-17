@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
-"""Check numbering definitions in original document"""
+"""Check numbering definitions in the 2025 reference document (see README.md)."""
+
+import sys
 
 from docx import Document
 from docx.oxml.ns import qn
+from reference_doc import find_reference_doc
 
-doc = Document("1-Elementor WordCamp Asia 2025 Super Admin Sponsorship Agreement.docx")
+reference_path = find_reference_doc()
+if reference_path is None:
+    sys.exit("No 2025 reference agreement (.docx) found in this folder — see README.md.")
+
+doc = Document(str(reference_path))
 
 # Check numbering part
 numbering_part = doc.part.numbering_part

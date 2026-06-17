@@ -1,0 +1,18 @@
+# Published sponsors list — one sponsor name per line.
+#
+# build_approval_company_email_csv.py uses this list to flag which companies in
+# your approval export are already shown on the public sponsors page. Copy this
+# file to "published_sponsors.txt" and fill in the names exactly as they appear
+# on your public page (e.g. https://<your-event>/sponsors/).
+#
+# Rules:
+#   - Blank lines and lines starting with "#" are ignored.
+#   - Matching is case-insensitive.
+#   - A row also matches when one name contains the other
+#     (e.g. "Acme" matches an approval row of "Acme Inc").
+#
+# published_sponsors.txt is git-ignored so real sponsor names stay local.
+#
+# Example Company One
+# Example Company Two
+# example-brand.com

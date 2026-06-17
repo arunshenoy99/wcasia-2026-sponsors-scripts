@@ -1,23 +1,21 @@
 """
 CLI: build Company Name + Email CSV from a local approval export; flag matches to the public sponsors page.
 
-Standalone (not used by main.py). Usage and data policy: Reachout/README.md (approval list section).
+Standalone (not used by main.py). The published-sponsors list is read from a local
+file (default: published_sponsors.txt next to this script; not committed) — see
+published_sponsors.example.txt for the format.
+
+Usage and data policy: Reachout/README.md (approval list section).
 """
 import argparse
 import csv
+import os
 import re
 import sys
 
-# Normalized names aligned with https://asia.wordcamp.org/2026/sponsors/ (public page; update as needed)
-PUBLISHED_SPONSORS = {
-    "elementor", "hostinger", "jetpack", "paypal", "pressable", "salesforce", "wordpress.com",
-    "google", "woo",
-    "astra", "automattic for agencies", "bluehost", "yoast",
-    "easy wp powered by spaceship", "kinsta", "knowledge pillars education inc", "rank math", "rtcamp", "wp rocket",
-    "hosting.com",
-    "flexicloud", "greengeeks web hosting", "rumahweb indonesia",
-    "flowmattic", "wpexperts",
-}
+DEFAULT_PUBLISHED_SPONSORS_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "published_sponsors.txt"
+)
 
 
 def _norm(s):
@@ -26,20 +24,32 @@ def _norm(s):
     return re.sub(r"\s+", " ", s.strip().lower())
 
 
-def _listed_on_site(company_name: str) -> bool:
-    """Check if company appears on the published WCAsia 2026 sponsors page (flexible match)."""
+def load_published_sponsors(path: str) -> set:
+    """Load published sponsor names from a text file (one per line; '#' comments ignored)."""
+    sponsors = set()
+    if not path or not os.path.isfile(path):
+        return sponsors
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            name = _norm(line)
+            if name:
+                sponsors.add(name)
+    return sponsors
+
+
+def _listed_on_site(company_name: str, published: set) -> bool:
+    """Check if company appears in the published sponsors list (case-insensitive, flexible match)."""
     n = _norm(company_name)
-    if not n:
+    if not n or not published:
         return False
-    if n in PUBLISHED_SPONSORS:
+    if n in published:
         return True
-    for pub in PUBLISHED_SPONSORS:
-        if pub in n or n in pub:
+    for pub in published:
+        if pub and (pub in n or n in pub):
             return True
-    if "spaceship" in n and ("easy" in n or "easywp" in n):
-        return True
-    if "wordpress.com" in n:
-        return True
     return False
 
 
@@ -57,9 +67,24 @@ def main():
         required=True,
         help="Path to write the output CSV (local only; do not commit if it contains contact data).",
     )
+    parser.add_argument(
+        "-p", "--published-sponsors",
+        default=DEFAULT_PUBLISHED_SPONSORS_FILE,
+        help="Path to the published sponsors list (default: published_sponsors.txt next to this script). "
+             "See published_sponsors.example.txt.",
+    )
     args = parser.parse_args()
     input_path = args.input
     output_path = args.output
+
+    published = load_published_sponsors(args.published_sponsors)
+    if not published:
+        print(
+            f"Warning: no published sponsors loaded from {args.published_sponsors!r}; "
+            "'Listed on public sponsors site' will be 'No' for every row. "
+            "Copy published_sponsors.example.txt to published_sponsors.txt to enable matching.",
+            file=sys.stderr,
+        )
 
     rows_out = []
     with open(input_path, "r", encoding="utf-8") as f:
@@ -88,15 +113,15 @@ def main():
             email = (row.get(email_col) or "").strip()
             if not company and not email:
                 continue
-            listed = "Yes" if _listed_on_site(company) else "No"
-            rows_out.append({"Company Name": company, "Email": email, "Listed on WCAsia 2026 site": listed})
+            listed = "Yes" if _listed_on_site(company, published) else "No"
+            rows_out.append({"Company Name": company, "Email": email, "Listed on public sponsors site": listed})
 
     with open(output_path, "w", encoding="utf-8", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=["Company Name", "Email", "Listed on WCAsia 2026 site"])
+        w = csv.DictWriter(f, fieldnames=["Company Name", "Email", "Listed on public sponsors site"])
         w.writeheader()
         w.writerows(rows_out)
 
-    listed_count = sum(1 for r in rows_out if r["Listed on WCAsia 2026 site"] == "Yes")
+    listed_count = sum(1 for r in rows_out if r["Listed on public sponsors site"] == "Yes")
     print(f"Wrote {len(rows_out)} rows to {output_path}")
     print(f"Listed on public sponsors page: {listed_count} of {len(rows_out)}")
     return 0
